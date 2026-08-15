@@ -11,9 +11,9 @@ works but that there are tests showing what breaks when the safeguards are remov
 
 | Invariant | Enforced by |
 |---|---|
-| Every transaction's debits equal its credits | Types, a deferred constraint trigger, and a reconciliation query |
+| Every transaction's debits equal its credits | Types, a deferred constraint trigger, and the reconciliation job |
 | A transaction has at least two entries across at least two accounts | Deferred constraint trigger |
-| Postings are never updated or deleted | Corrections are reversing entries, not edits |
+| Postings are never updated or deleted | The application role holds no `UPDATE` or `DELETE`. Corrections are reversing entries |
 | A balance is never a stored, authoritative value | It is `sum(signed_amount)`; there is no balance column |
 | A retry with the same idempotency key posts once | `unique (idempotency_key)` |
 | The same key with a different payload is an error, not a replay | A stored fingerprint of the request |
@@ -36,6 +36,60 @@ account row is used as an exclusion token; it is never modified.
 `tests/integration/concurrency.test.ts` contains both halves: a test that reproduces the
 overdraft with the lock removed, and a test that shows the real path refusing the second
 withdrawal.
+
+## Roles
+
+Three connection strings, because one would mean one set of privileges:
+
+| Variable | Role | May |
+|---|---|---|
+| `DATABASE_ADMIN_URL` | the owner | everything; runs migrations and provisioning |
+| `DATABASE_URL` | the application | `SELECT`, `INSERT` |
+| `DATABASE_AUDITOR_URL` | the reconciliation job | `SELECT` |
+
+There is no `REVOKE` anywhere in the migrations, and that is the mechanism rather than an
+oversight: a new role holds no privileges at all and `PUBLIC` holds none on these tables,
+so immutability comes from never granting `UPDATE` or `DELETE`. Revoking a privilege nobody
+was given would read as protection while doing nothing.
+
+`ledger_app` and `ledger_auditor` are `NOLOGIN` groups created by the migration, which
+settles what each role may do and never who may become one. `provision` creates the
+identities that connect and adds them to a group, so a database that has only been migrated
+has no new way into it and no credential ever lives in a migration file.
+
+None of this means anything from a superuser connection, since a superuser bypasses
+privilege checks entirely -- so `tests/integration/permissions.test.ts` asserts that
+`DATABASE_URL` is not one before asserting anything else.
+
+## Reconciliation
+
+```bash
+npm run reconcile
+```
+
+Six checks, read-only, against the ledger as it stands. Exit `0` if it reconciles, `2` if it
+does not, `1` if the job itself could not run -- "the books are wrong" and "the auditor is
+broken" being different incidents.
+
+Every check runs inside one `repeatable read read only` transaction, so all of them observe
+a single snapshot. Under the default isolation level each statement takes its own, and a
+transaction committing partway through leaves the checks describing two different ledgers.
+Snapshot isolation does not prevent write skew, which is why the write path uses row locks
+instead; this job never writes, so the anomaly it cannot prevent is not one it can cause.
+
+Two of the checks are worth singling out:
+
+- **Per currency.** A transaction with a 100 USD debit and a 100 JPY credit sums to zero in
+  raw minor units and passes as balanced. Comparing money that was never comparable is the
+  error a single total cannot see.
+- **Accounts below zero.** The only rule here with no database backstop at all: nothing but
+  a check inside the write lock enforces it, so nothing but this would notice a write that
+  went around it.
+
+Proving the job detects anything means creating corruption the schema exists to prevent.
+The tests write it inside a transaction and audit it on the same connection without ever
+committing: the constraint triggers are deferred, so they fire at `COMMIT` and a
+transaction that never commits never fires them.
 
 ## Design notes
 
@@ -72,9 +126,14 @@ seeded in tests.
 docker compose up -d
 cp .env.example .env
 npm install
-npm run migrate
+npm run migrate      # schema, and the roles' privileges
+npm run provision    # lets the roles the connection strings name actually log in
 npm run demo
+npm run reconcile
 ```
+
+`provision` runs after `migrate` and not before: the groups its logins join have to exist
+first. Both are idempotent, so running either again does nothing.
 
 `npm run demo` walks the whole path against the real database: it opens accounts, funds
 one, transfers between two, replays the transfer as a retry would send it, then shows the
@@ -89,8 +148,10 @@ npm run typecheck
 ```
 
 Unit tests cover the pure domain rules and need nothing running. Integration tests run
-against a real PostgreSQL instance and skip themselves when `DATABASE_URL` is absent. CI
-runs both against a `postgres:18` service container using these same migration files.
+against a real PostgreSQL instance and skip themselves when `DATABASE_URL` is absent -- and
+refuse to skip when `CI` is set, because a green run that proved nothing is worse than a red
+one. CI runs both against a `postgres:18` service container using these same migration
+files, then reconciles the ledger the suite left behind.
 
 ## Layout
 
@@ -99,22 +160,27 @@ migrations/       versioned SQL; an applied migration is never edited
 src/domain/       entities and the pure double-entry rules. No I/O.
 src/application/  use cases and the ports they depend on
 src/adapters/     PostgreSQL, id generation
-src/entry/        composition roots: migrate, demo
+src/entry/        composition roots: migrate, demo, reconcile
 tests/unit/       pure rules
-tests/integration/what the database refuses, and the concurrency proofs
+tests/integration/what the database refuses, the concurrency proofs, the audit
 ```
 
 Dependencies point inwards: `src/domain` does not know PostgreSQL exists.
 
 ## Not built yet
 
-A reconciliation job, an HTTP surface, multi-currency transactions with FX, and balance
-snapshots for accounts too large to sum. Balance snapshots are deliberately absent: caching
-a balance before measuring that summing is too slow would be optimising a problem nobody
-has shown exists.
+An HTTP surface, multi-currency transactions with FX, and balance snapshots for accounts
+too large to sum. Balance snapshots are deliberately absent: caching a balance before
+measuring that summing is too slow would be optimising a problem nobody has shown exists.
 
-One known gap: appending a balanced pair of entries to an already-committed transaction is
-refused by nothing in the schema today. The reconciliation job is where that gets caught.
+One known gap, stated precisely because the obvious guess about it is wrong: appending a
+*balanced* pair of entries to an already-committed transaction is refused by nothing in the
+schema, and **the reconciliation job cannot catch it either**. The result balances by every
+check the job makes -- per transaction, per currency, globally -- because it genuinely does
+balance. It is a history that was rewritten, not a sum that stopped adding up, and no
+amount of summing distinguishes the two. Closing it means taking away the right to insert
+into a transaction that already exists, which is a question about roles and permissions
+rather than about arithmetic.
 
 ## License
 

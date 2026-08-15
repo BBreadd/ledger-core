@@ -32,8 +32,14 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
+    # One connection string per role, exactly as .env.example lays them out. The
+    # application's URL is not the owner's: a suite that connected as a superuser would
+    # watch every permission assertion pass while proving nothing, since a superuser
+    # bypasses privilege checks entirely.
     env:
-      DATABASE_URL: postgresql://ledger:ledger@localhost:5432/ledger
+      DATABASE_ADMIN_URL: postgresql://ledger:ledger@localhost:5432/ledger
+      DATABASE_URL: postgresql://ledger_writer:ledger_writer@localhost:5432/ledger
+      DATABASE_AUDITOR_URL: postgresql://ledger_reader:ledger_reader@localhost:5432/ledger
 
     steps:
       - uses: actions/checkout@v7
@@ -54,5 +60,21 @@ jobs:
       - name: Migrations are idempotent
         run: npm run migrate
 
+      # After the migration, never before: the group roles these logins join have to
+      # exist first. Run twice for the same reason migrate is: provisioning an already
+      # provisioned database must be a no-op, not an error.
+      - name: Provision the login roles
+        run: npm run provision
+
+      - name: Provisioning is idempotent
+        run: npm run provision
+
       - name: Test
         run: npm test
+
+      # Audits the ledger the suite just built, including every write it made through the
+      # real code path and every one it forced in raw. The tests prove the job notices
+      # corruption; this proves there is none to notice. Exits 2 if the books do not
+      # reconcile, which fails the job.
+      - name: Reconcile
+        run: npm run reconcile

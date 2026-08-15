@@ -7,7 +7,11 @@ import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import type { PostOutcome } from "../../src/application/post-transaction.ts";
-import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
+import {
+  integrationAdminUrl,
+  integrationDatabaseUrl,
+  skipWithoutDatabase,
+} from "./database-url.ts";
 
 const newId = createUuidV7();
 
@@ -19,9 +23,16 @@ describe(
     const store = createLedgerStore(url);
     const pool = new pg.Pool({ connectionString: url });
 
+    // Deleting a posting is not something the application may do, by design. Undoing a
+    // violation this file commits on purpose is therefore the owner's job, and needing a
+    // second connection to do it is the permission model working rather than getting in
+    // the way.
+    const admin = new pg.Pool({ connectionString: integrationAdminUrl ?? "" });
+
     after(async () => {
       await store.close();
       await pool.end();
+      await admin.end();
     });
 
     /**
@@ -59,8 +70,17 @@ describe(
         b.release();
       }
 
-      const balance = await store.balanceOf(checking);
-      assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
+      // Cleared again before this returns. The overdraft has to be committed for the
+      // demonstration to mean anything, and it is a real violation of the rule that no
+      // account may go below zero -- leaving it behind would plant a permanent anomaly
+      // that every future audit reports and nobody caused. A test that commits a
+      // deliberate violation and walks away turns the auditor into a liar.
+      try {
+        const balance = await store.balanceOf(checking);
+        assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
+      } finally {
+        await erase(admin, [checking, revenue]);
+      }
     });
 
     /**
@@ -170,6 +190,42 @@ async function seedAccounts(
   }
 
   return { checking, revenue };
+}
+
+/**
+ * Removes every trace of the given accounts: their entries, the transactions those
+ * entries belonged to, and the accounts themselves.
+ *
+ * All of it in one database transaction, because the intermediate state -- entries gone,
+ * headers still there -- is itself an anomaly, and test files run in parallel, so an
+ * audit running in another file could snapshot it and report transactions with no
+ * entries that never existed for anyone.
+ *
+ * Takes the owner's pool, not the application's: DELETE on entries is a privilege the
+ * application does not hold and `tests/integration/permissions.test.ts` proves it.
+ */
+async function erase(pool: pg.Pool, accountIds: readonly string[]): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const touched = await client.query<{ transaction_id: string }>(
+      "select distinct transaction_id from entries where account_id = any($1::uuid[])",
+      [accountIds],
+    );
+    const transactionIds = touched.rows.map((row) => row.transaction_id);
+
+    await client.query("delete from entries where transaction_id = any($1::uuid[])", [
+      transactionIds,
+    ]);
+    await client.query("delete from transactions where id = any($1::uuid[])", [transactionIds]);
+    await client.query("delete from accounts where id = any($1::uuid[])", [accountIds]);
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function readBalance(client: pg.PoolClient, accountId: string): Promise<bigint> {

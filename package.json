@@ -11,7 +11,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "migrate": "node --env-file-if-exists=.env src/entry/migrate.ts",
+    "provision": "node --env-file-if-exists=.env src/entry/provision.ts",
     "demo": "node --env-file-if-exists=.env src/entry/demo.ts",
+    "reconcile": "node --env-file-if-exists=.env src/entry/reconcile.ts",
     "test": "node --env-file-if-exists=.env --test \"tests/**/*.test.ts\""
   },
   "dependencies": {

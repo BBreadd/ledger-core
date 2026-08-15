@@ -56,3 +56,10 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # Audits the ledger the suite just built, including every write it made through the
+      # real code path and every one it forced in raw. The tests prove the job notices
+      # corruption; this proves there is none to notice. Exits 2 if the books do not
+      # reconcile, which fails the job.
+      - name: Reconcile
+        run: npm run reconcile

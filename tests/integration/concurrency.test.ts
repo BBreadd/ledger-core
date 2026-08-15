@@ -59,8 +59,17 @@ describe(
         b.release();
       }
 
-      const balance = await store.balanceOf(checking);
-      assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
+      // Cleared again before this returns. The overdraft has to be committed for the
+      // demonstration to mean anything, and it is a real violation of the rule that no
+      // account may go below zero -- leaving it behind would plant a permanent anomaly
+      // that every future audit reports and nobody caused. A test that commits a
+      // deliberate violation and walks away turns the auditor into a liar.
+      try {
+        const balance = await store.balanceOf(checking);
+        assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
+      } finally {
+        await erase(pool, [checking, revenue]);
+      }
     });
 
     /**
@@ -170,6 +179,43 @@ async function seedAccounts(
   }
 
   return { checking, revenue };
+}
+
+/**
+ * Removes every trace of the given accounts: their entries, the transactions those
+ * entries belonged to, and the accounts themselves.
+ *
+ * All of it in one database transaction, because the intermediate state -- entries gone,
+ * headers still there -- is itself an anomaly, and test files run in parallel, so an
+ * audit running in another file could snapshot it and report transactions with no
+ * entries that never existed for anyone.
+ *
+ * Deleting postings is not something the application may do; it is something this test
+ * has to do to undo a violation it created on purpose. Once the ledger role loses DELETE,
+ * tests keep this ability only by connecting as the owner.
+ */
+async function erase(pool: pg.Pool, accountIds: readonly string[]): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const touched = await client.query<{ transaction_id: string }>(
+      "select distinct transaction_id from entries where account_id = any($1::uuid[])",
+      [accountIds],
+    );
+    const transactionIds = touched.rows.map((row) => row.transaction_id);
+
+    await client.query("delete from entries where transaction_id = any($1::uuid[])", [
+      transactionIds,
+    ]);
+    await client.query("delete from transactions where id = any($1::uuid[])", [transactionIds]);
+    await client.query("delete from accounts where id = any($1::uuid[])", [accountIds]);
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function readBalance(client: pg.PoolClient, accountId: string): Promise<bigint> {

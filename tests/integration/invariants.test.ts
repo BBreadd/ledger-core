@@ -4,15 +4,15 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
 
-const databaseUrl = process.env["DATABASE_URL"];
 const newId = createUuidV7();
 
 describe(
   "invariants enforced by the database itself",
-  { skip: databaseUrl === undefined ? "DATABASE_URL is not set" : false },
+  { skip: skipWithoutDatabase },
   () => {
-    const pool = new pg.Pool({ connectionString: databaseUrl ?? "" });
+    const pool = new pg.Pool({ connectionString: integrationDatabaseUrl ?? "" });
     let usd: string;
     let eur: string;
 

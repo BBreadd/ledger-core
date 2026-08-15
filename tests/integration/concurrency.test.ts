@@ -7,15 +7,15 @@ import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import type { PostOutcome } from "../../src/application/post-transaction.ts";
+import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
 
-const databaseUrl = process.env["DATABASE_URL"];
 const newId = createUuidV7();
 
 describe(
   "concurrent transfers against the same account",
-  { skip: databaseUrl === undefined ? "DATABASE_URL is not set" : false },
+  { skip: skipWithoutDatabase },
   () => {
-    const url = databaseUrl ?? "";
+    const url = integrationDatabaseUrl ?? "";
     const store = createLedgerStore(url);
     const pool = new pg.Pool({ connectionString: url });
 

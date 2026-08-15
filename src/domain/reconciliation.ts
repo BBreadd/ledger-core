@@ -10,7 +10,8 @@ export type CheckId =
   | "TRANSACTION_SHAPE"
   | "CURRENCY_NET"
   | "TRANSACTION_CURRENCY_SPAN"
-  | "NEGATIVE_BALANCE";
+  | "NEGATIVE_BALANCE"
+  | "REVERSAL_INTEGRITY";
 
 export type Anomaly = {
   /** The id the anomaly is about: a transaction, an account, a currency code. */

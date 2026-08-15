@@ -26,6 +26,7 @@ export type StoredEntry = {
   readonly accountId: string;
   readonly direction: Direction;
   readonly amount: Amount;
+  readonly currency: string;
 };
 
 export type StoredTransaction = {
@@ -36,6 +37,8 @@ export type StoredTransaction = {
   readonly description: string;
   readonly occurredAt: Date;
   readonly recordedAt: Date;
+  /** The transaction this one undoes, or null when it is an ordinary posting. */
+  readonly reversesTransactionId: string | null;
   readonly entries: readonly StoredEntry[];
 };
 
@@ -45,7 +48,8 @@ export type TransactionToInsert = {
   readonly requestHash: string;
   readonly description: string;
   readonly occurredAt: Date;
-  readonly entries: readonly (StoredEntry & { readonly currency: string })[];
+  readonly reversesTransactionId: string | null;
+  readonly entries: readonly StoredEntry[];
 };
 
 /**
@@ -63,9 +67,13 @@ export type UnitOfWork = {
   /**
    * Writes the transaction and all of its entries, and returns it as stored, including
    * the values the database assigns (seq, recorded_at).
-   * Throws DuplicateIdempotencyKeyError when the key is already taken.
+   * Throws DuplicateIdempotencyKeyError when the key is already taken, and
+   * AlreadyReversedError when the transaction being reversed already has a reversal.
    */
   insertTransaction(transaction: TransactionToInsert): Promise<StoredTransaction>;
+
+  /** The transaction with this id and all of its entries, or null if there is none. */
+  findTransaction(id: string): Promise<StoredTransaction | null>;
 };
 
 export type LedgerStore = {
@@ -109,6 +117,12 @@ export type ReconciliationSource = {
 
   /** Accounts sitting below zero despite being declared unable to. */
   overdrawnAccounts(limit: number): Promise<CheckFindings>;
+
+  /**
+   * Reversals that are not the exact mirror of what they claim to undo, or that undo
+   * something which was itself a reversal.
+   */
+  brokenReversals(limit: number): Promise<CheckFindings>;
 };
 
 /**
@@ -128,6 +142,22 @@ export class DuplicateIdempotencyKeyError extends Error {
   constructor(detail: string) {
     super(`idempotency key already in use (${detail})`);
     this.name = "DuplicateIdempotencyKeyError";
+    this.detail = detail;
+  }
+}
+
+/**
+ * Raised when the unique index on reverses_transaction_id rejects an insert, meaning the
+ * transaction already had a reversal. Distinct from the error above even though both
+ * arrive as SQLSTATE 23505, which is why the adapter matches on the constraint name and
+ * not on the code alone: two unique indexes on one table are two different facts.
+ */
+export class AlreadyReversedError extends Error {
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super(`transaction has already been reversed (${detail})`);
+    this.name = "AlreadyReversedError";
     this.detail = detail;
   }
 }

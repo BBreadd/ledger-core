@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import type { Amount, Direction } from "./money.ts";
-import { signedAmount } from "./money.ts";
+import { flip, signedAmount } from "./money.ts";
 
 export type EntryDraft = {
   readonly accountId: string;
@@ -91,6 +91,47 @@ export function validate(draft: TransactionDraft): readonly Violation[] {
   }
 
   return violations;
+}
+
+/** A leg's economic content: everything about it except which row it is. */
+export type EntryContent = {
+  readonly accountId: string;
+  readonly direction: Direction;
+  readonly amount: Amount;
+  readonly currency: string;
+};
+
+/**
+ * The correction for a posting that should never have been made. Every leg comes back on
+ * the same account for the same amount in the opposite direction, so the pair nets to zero
+ * on every account it touched and the original stays in the record instead of vanishing.
+ *
+ * Order is preserved rather than sorted. The database compares the two sets with EXCEPT
+ * ALL, which ignores order but counts multiplicity, so a transaction with two identical
+ * legs has to come back as two identical legs and not as one.
+ */
+export function mirror(entries: readonly EntryContent[]): readonly EntryContent[] {
+  return entries.map((entry) => ({
+    accountId: entry.accountId,
+    direction: flip(entry.direction),
+    amount: entry.amount,
+    currency: entry.currency,
+  }));
+}
+
+/**
+ * Fingerprint of a reversal request. Same purpose as the one below: telling an honest
+ * retry apart from the same key being reused for something else. What identifies a
+ * reversal is which transaction it undoes, so that is what gets hashed -- its entries are
+ * derived from the original and would add nothing.
+ */
+export function reversalFingerprint(request: {
+  readonly idempotencyKey: string;
+  readonly transactionId: string;
+  readonly description: string;
+}): string {
+  const payload = [request.idempotencyKey, request.transactionId, request.description].join("\n");
+  return createHash("sha256").update(payload).digest("hex");
 }
 
 /**

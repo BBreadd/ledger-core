@@ -6,6 +6,8 @@ import { createLedgerStore } from "../adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../adapters/uuid-v7.ts";
 import { postTransaction } from "../application/post-transaction.ts";
 import type { PostOutcome } from "../application/post-transaction.ts";
+import { reverseTransaction } from "../application/reverse-transaction.ts";
+import type { ReverseOutcome } from "../application/reverse-transaction.ts";
 import type { LedgerStore } from "../application/ports.ts";
 import { normalBalance } from "../domain/account.ts";
 import { format } from "../domain/money.ts";
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
     );
 
     step("2. Transfer 120.00 from checking to savings");
+    let transferId = "";
     const transfer: TransactionDraft = {
       idempotencyKey: `${run}-transfer`,
       description: "Move to savings",
@@ -68,7 +71,11 @@ async function main(): Promise<void> {
         { accountId: checking, direction: "credit", amount: 12_000n },
       ],
     };
-    await show(postTransaction(deps, transfer));
+    const transferOutcome = await postTransaction(deps, transfer);
+    if (transferOutcome.status === "posted") {
+      transferId = transferOutcome.transaction.id;
+    }
+    await show(Promise.resolve(transferOutcome));
 
     step("3. The exact same request again, as a retry would send it");
     await show(postTransaction(deps, transfer));
@@ -110,6 +117,24 @@ async function main(): Promise<void> {
       }),
     );
 
+    step("7. Undo the transfer -- the only correction there is, since editing is impossible");
+    await showReversal(
+      reverseTransaction(deps, {
+        transactionId: transferId,
+        idempotencyKey: `${run}-undo-transfer`,
+        description: "Transfer was made in error",
+      }),
+    );
+
+    step("8. Undo it a second time");
+    await showReversal(
+      reverseTransaction(deps, {
+        transactionId: transferId,
+        idempotencyKey: `${run}-undo-again`,
+        description: "Should be refused",
+      }),
+    );
+
     console.log("\nbalances");
     await printBalance(store, "checking", checking, "asset");
     await printBalance(store, "savings ", savings, "asset");
@@ -132,6 +157,20 @@ async function show(outcome: Promise<PostOutcome>): Promise<void> {
     return;
   }
   console.log(`   ${result.status}  seq=${result.transaction.seq}  id=${result.transaction.id}`);
+}
+
+async function showReversal(outcome: Promise<ReverseOutcome>): Promise<void> {
+  const result = await outcome;
+  if (result.status === "rejected") {
+    for (const rejection of result.rejections) {
+      console.log(`   rejected  ${rejection.code}: ${rejection.message}`);
+    }
+    return;
+  }
+  console.log(
+    `   ${result.status}  seq=${result.transaction.seq}  ` +
+      `id=${result.transaction.id}  reverses=${result.transaction.reversesTransactionId}`,
+  );
 }
 
 async function printBalance(

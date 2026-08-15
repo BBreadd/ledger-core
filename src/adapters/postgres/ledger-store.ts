@@ -11,7 +11,7 @@ import type {
   TransactionToInsert,
   UnitOfWork,
 } from "../../application/ports.ts";
-import { DuplicateIdempotencyKeyError } from "../../application/ports.ts";
+import { AlreadyReversedError, DuplicateIdempotencyKeyError } from "../../application/ports.ts";
 import type { AccountType } from "../../domain/account.ts";
 import type { Direction } from "../../domain/money.ts";
 
@@ -43,6 +43,11 @@ function toBigInt(value: unknown, column: string): bigint {
 
 const UNIQUE_VIOLATION = "23505";
 const IDEMPOTENCY_KEY_CONSTRAINT = "transactions_idempotency_key_key";
+const REVERSES_ONCE_CONSTRAINT = "transactions_reverses_once";
+
+const TRANSACTION_COLUMNS = `id, seq, idempotency_key, request_hash, description,
+                             occurred_at, recorded_at, reverses_transaction_id`;
+const ENTRY_COLUMNS = "id, account_id, currency, direction, amount";
 
 export function createLedgerStore(databaseUrl: string): LedgerStore {
   const pool = new pg.Pool({ connectionString: databaseUrl });
@@ -90,7 +95,7 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
     },
 
     findByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
-      return loadByIdempotencyKey(pool, key);
+      return loadTransaction(pool, "idempotency_key", key);
     },
 
     async close(): Promise<void> {
@@ -134,11 +139,16 @@ function unitOfWork(client: PoolClient): UnitOfWork {
       }));
     },
 
+    findTransaction(id: string): Promise<StoredTransaction | null> {
+      return loadTransaction(client, "id", id);
+    },
+
     async insertTransaction(transaction: TransactionToInsert): Promise<StoredTransaction> {
       const header = await client.query<{ seq: unknown; recorded_at: Date }>(
         `insert into transactions
-           (id, idempotency_key, request_hash, description, occurred_at)
-         values ($1, $2, $3, $4, $5)
+           (id, idempotency_key, request_hash, description, occurred_at,
+            reverses_transaction_id)
+         values ($1, $2, $3, $4, $5, $6)
          returning seq, recorded_at`,
         [
           transaction.id,
@@ -146,6 +156,7 @@ function unitOfWork(client: PoolClient): UnitOfWork {
           transaction.requestHash,
           transaction.description,
           transaction.occurredAt,
+          transaction.reversesTransactionId,
         ],
       );
 
@@ -177,10 +188,12 @@ function unitOfWork(client: PoolClient): UnitOfWork {
         description: transaction.description,
         occurredAt: transaction.occurredAt,
         recordedAt: row.recorded_at,
+        reversesTransactionId: transaction.reversesTransactionId,
         entries: transaction.entries.map(
           (entry): StoredEntry => ({
             id: entry.id,
             accountId: entry.accountId,
+            currency: entry.currency,
             direction: entry.direction,
             amount: entry.amount,
           }),
@@ -208,24 +221,33 @@ type TransactionRow = QueryResultRow & {
   description: string;
   occurred_at: Date;
   recorded_at: Date;
+  reverses_transaction_id: string | null;
 };
 
 type EntryRow = QueryResultRow & {
   id: string;
   account_id: string;
+  currency: string;
   direction: Direction;
   amount: unknown;
 };
 
-async function loadByIdempotencyKey(
-  queryable: pg.Pool,
-  key: string,
+type Queryable = {
+  query<R extends QueryResultRow>(
+    text: string,
+    values?: readonly unknown[],
+  ): Promise<pg.QueryResult<R>>;
+};
+
+/** Rebuilds a transaction and its entries from whatever connection is handed in. */
+async function loadTransaction(
+  queryable: Queryable,
+  where: string,
+  value: string,
 ): Promise<StoredTransaction | null> {
   const header = await queryable.query<TransactionRow>(
-    `select id, seq, idempotency_key, request_hash, description, occurred_at, recorded_at
-       from transactions
-      where idempotency_key = $1`,
-    [key],
+    `select ${TRANSACTION_COLUMNS} from transactions where ${where} = $1`,
+    [value],
   );
 
   const row = header.rows[0];
@@ -234,7 +256,7 @@ async function loadByIdempotencyKey(
   }
 
   const entries = await queryable.query<EntryRow>(
-    "select id, account_id, direction, amount from entries where transaction_id = $1 order by id",
+    `select ${ENTRY_COLUMNS} from entries where transaction_id = $1 order by id`,
     [row.id],
   );
 
@@ -246,9 +268,11 @@ async function loadByIdempotencyKey(
     description: row.description,
     occurredAt: row.occurred_at,
     recordedAt: row.recorded_at,
+    reversesTransactionId: row.reverses_transaction_id,
     entries: entries.rows.map((entry) => ({
       id: entry.id,
       accountId: entry.account_id,
+      currency: entry.currency.trim(),
       direction: entry.direction,
       amount: toBigInt(entry.amount, "amount"),
     })),
@@ -256,18 +280,31 @@ async function loadByIdempotencyKey(
 }
 
 /**
- * Turns the one database error that is part of the contract into a domain-level error,
- * and leaves every other error alone so real bugs stay loud.
+ * Turns the database errors that are part of the contract into domain-level errors, and
+ * leaves every other error alone so real bugs stay loud.
+ *
+ * Matched on the constraint name rather than on SQLSTATE, because two unique indexes on
+ * transactions both report 23505 and they mean entirely different things: "this request
+ * already happened" and "this transaction was already reversed". Reading the code alone
+ * would answer a retry with the wrong story.
  */
 function translate(error: unknown): unknown {
   if (
-    error instanceof Error &&
-    "code" in error &&
-    error.code === UNIQUE_VIOLATION &&
-    "constraint" in error &&
-    error.constraint === IDEMPOTENCY_KEY_CONSTRAINT
+    !(error instanceof Error) ||
+    !("code" in error) ||
+    error.code !== UNIQUE_VIOLATION ||
+    !("constraint" in error)
   ) {
-    return new DuplicateIdempotencyKeyError("detail" in error ? String(error.detail) : "unknown");
+    return error;
+  }
+
+  const detail = "detail" in error ? String(error.detail) : "unknown";
+
+  if (error.constraint === IDEMPOTENCY_KEY_CONSTRAINT) {
+    return new DuplicateIdempotencyKeyError(detail);
+  }
+  if (error.constraint === REVERSES_ONCE_CONSTRAINT) {
+    return new AlreadyReversedError(detail);
   }
   return error;
 }

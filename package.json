@@ -1,0 +1,25 @@
+{
+  "name": "ledger-core",
+  "version": "0.1.0",
+  "description": "A double-entry ledger engine with immutable postings, derived balances and idempotent writes.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "migrate": "node src/entry/migrate.ts",
+    "demo": "node src/entry/demo.ts",
+    "test": "node --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.21.0",
+    "typescript": "^5.9.0"
+  }
+}

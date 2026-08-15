@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: ledger-core-db
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres 18 moved its declared VOLUME to /var/lib/postgresql and made PGDATA
+      # version-specific (/var/lib/postgresql/18/docker). Mounting the pre-18 path
+      # /var/lib/postgresql/data does not fail loudly -- it just silently stops
+      # persisting anything.
+      - ledger-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  ledger-data:

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+
+.env
+*.local
+
+# Working memory between sessions, in Spanish. The repo itself is English.
+Ledger_Estado_y_Roadmap.md
+
+*.log
+npm-debug.log*
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

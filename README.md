@@ -14,6 +14,9 @@ works but that there are tests showing what breaks when the safeguards are remov
 | Every transaction's debits equal its credits | Types, a deferred constraint trigger, and the reconciliation job |
 | A transaction has at least two entries across at least two accounts | Deferred constraint trigger |
 | Postings are never updated or deleted | The application role holds no `UPDATE` or `DELETE`. Corrections are reversing entries |
+| A reversal is the exact mirror of what it undoes | Built from the original, checked by a deferred trigger, audited afterwards |
+| A transaction is reversed at most once | `unique (reverses_transaction_id)` |
+| A reversal is not itself reversible | A deferred trigger; post the original again instead |
 | A balance is never a stored, authoritative value | It is `sum(signed_amount)`; there is no balance column |
 | A retry with the same idempotency key posts once | `unique (idempotency_key)` |
 | The same key with a different payload is an error, not a replay | A stored fingerprint of the request |
@@ -36,6 +39,31 @@ account row is used as an exclusion token; it is never modified.
 `tests/integration/concurrency.test.ts` contains both halves: a test that reproduces the
 overdraft with the lock removed, and a test that shows the real path refusing the second
 withdrawal.
+
+## Corrections
+
+A posting cannot be edited, so it is corrected by posting its exact mirror: every leg back
+on the same account for the same amount in the opposite direction, linked to the original
+through `reverses_transaction_id`. The pair nets to zero on every account it touched, and
+the mistake stays in the record instead of disappearing from it. A corrected ledger has two
+transactions in it, not one rewritten transaction, and that is the difference between a
+record and a draft.
+
+Three things about it are worth stating outright:
+
+**A reversal takes no lock.** The posting path locks every account it touches because it
+reads a balance and then decides. A reversal reads no balance, so there is no
+read-then-write to race, and contention that does not exist does not need preventing.
+
+**A reversal is allowed to leave an account short.** By the time an error is found the money
+has often been spent, and refusing the correction because the account cannot afford it would
+freeze the mistake in place: the ledger would stay wrong precisely because fixing it did not
+fit. The shortfall this leaves is real, and the audit reports it rather than exempting it —
+what the reversal changes is that the cause is on the record, not that the money is back.
+
+**A reversal cannot be reversed.** Undoing the undo of A is a roundabout way of posting A
+again, and it leaves a chain whose meaning depends on counting its length. Posting A again,
+with its own idempotency key, says the same thing and reads as what it is.
 
 ## Roles
 
@@ -67,8 +95,8 @@ privilege checks entirely -- so `tests/integration/permissions.test.ts` asserts 
 npm run reconcile
 ```
 
-Six checks, read-only, against the ledger as it stands. Exit `0` if it reconciles, `2` if it
-does not, `1` if the job itself could not run -- "the books are wrong" and "the auditor is
+Seven checks, read-only, against the ledger as it stands. Exit `0` if it reconciles, `2` if
+it does not, `1` if the job itself could not run -- "the books are wrong" and "the auditor is
 broken" being different incidents.
 
 Every check runs inside one `repeatable read read only` transaction, so all of them observe
@@ -77,7 +105,7 @@ transaction committing partway through leaves the checks describing two differen
 Snapshot isolation does not prevent write skew, which is why the write path uses row locks
 instead; this job never writes, so the anomaly it cannot prevent is not one it can cause.
 
-Two of the checks are worth singling out:
+Three of the checks are worth singling out:
 
 - **Per currency.** A transaction with a 100 USD debit and a 100 JPY credit sums to zero in
   raw minor units and passes as balanced. Comparing money that was never comparable is the
@@ -85,6 +113,10 @@ Two of the checks are worth singling out:
 - **Accounts below zero.** The only rule here with no database backstop at all: nothing but
   a check inside the write lock enforces it, so nothing but this would notice a write that
   went around it.
+- **Reversal integrity.** A reversal that is not the exact mirror of its original balances
+  perfectly on its own, so every other check passes it. Only the comparison against what it
+  claims to undo exposes it — and a correction that does not correct is worse than none,
+  because the ledger then reads as settled with the error still in force.
 
 Proving the job detects anything means creating corruption the schema exists to prevent.
 The tests write it inside a transaction and audit it on the same connection without ever
@@ -138,7 +170,7 @@ first. Both are idempotent, so running either again does nothing.
 `npm run demo` walks the whole path against the real database: it opens accounts, funds
 one, transfers between two, replays the transfer as a retry would send it, then shows the
 same key with a different payload, an unbalanced transaction and an overdraft all being
-refused.
+refused, and finally reverses the transfer and watches a second reversal be turned away.
 
 ## Testing
 

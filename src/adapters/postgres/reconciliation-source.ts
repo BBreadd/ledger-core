@@ -190,6 +190,63 @@ export function createReconciliationSource(client: ClientBase): ReconciliationSo
           `type=${String(row["type"])} balance=${toBigInt(row["balance"], "balance")}`,
       );
     },
+
+    /**
+     * Two ways a correction can be a lie, asked as one question because the answer a
+     * person wants is "can I trust the corrections".
+     *
+     * The mirror comparison uses EXCEPT ALL in both directions, which counts multiplicity:
+     * a reversal that brings back one leg of an identical pair is not a mirror, and a
+     * plain set difference would say it was. flip_direction() is the same function the
+     * write-time trigger uses, so the audit cannot disagree with the gate about what the
+     * opposite of a debit is.
+     */
+    brokenReversals(limit: number): Promise<CheckFindings> {
+      return findings(
+        client,
+        `with reversals as (
+           select r.id, r.reverses_transaction_id as original_id,
+                  o.reverses_transaction_id is not null as original_is_reversal
+             from transactions r
+             join transactions o on o.id = r.reverses_transaction_id
+            where r.reverses_transaction_id is not null
+         ),
+         mismatches as (
+           select v.id,
+                  (select count(*) from (
+                     (select account_id, currency, flip_direction(direction) as direction, amount
+                        from entries where transaction_id = v.id
+                      except all
+                      select account_id, currency, direction, amount
+                        from entries where transaction_id = v.original_id)
+                     union all
+                     (select account_id, currency, direction, amount
+                        from entries where transaction_id = v.original_id
+                      except all
+                      select account_id, currency, flip_direction(direction) as direction, amount
+                        from entries where transaction_id = v.id)
+                   ) as d) as differing_legs,
+                  v.original_is_reversal,
+                  v.original_id
+             from reversals v
+         )
+         select id::text          as subject,
+                original_id::text as original,
+                differing_legs,
+                original_is_reversal,
+                count(*) over ()  as anomaly_total
+           from mismatches
+          where differing_legs > 0 or original_is_reversal
+          order by id
+          limit $1`,
+        [limit],
+        (row) =>
+          row["original_is_reversal"] === true
+            ? `reverses=${String(row["original"])} problem=original_is_itself_a_reversal`
+            : `reverses=${String(row["original"])} ` +
+              `problem=not_a_mirror legs=${toBigInt(row["differing_legs"], "differing_legs")}`,
+      );
+    },
   };
 }
 

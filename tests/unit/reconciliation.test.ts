@@ -19,6 +19,7 @@ function sourceThatFinds(overrides: Partial<ReconciliationSource> = {}): Reconci
     unbalancedCurrencies: async () => NOTHING,
     multiCurrencyTransactions: async () => NOTHING,
     overdrawnAccounts: async () => NOTHING,
+    brokenReversals: async () => NOTHING,
     ...overrides,
   };
 }
@@ -40,6 +41,7 @@ describe("reconcile", () => {
         "CURRENCY_NET",
         "TRANSACTION_CURRENCY_SPAN",
         "NEGATIVE_BALANCE",
+        "REVERSAL_INTEGRITY",
       ],
       "a check that stops being reported stops being evidence of anything",
     );

@@ -85,14 +85,13 @@ export async function postTransaction(
         return rejected("INSUFFICIENT_FUNDS", overdrawn.join("; "));
       }
 
-      const entries: readonly (StoredEntry & { readonly currency: string })[] =
-        draft.entries.map((entry) => ({
-          id: deps.newId(),
-          accountId: entry.accountId,
-          direction: entry.direction,
-          amount: entry.amount,
-          currency,
-        }));
+      const entries: readonly StoredEntry[] = draft.entries.map((entry) => ({
+        id: deps.newId(),
+        accountId: entry.accountId,
+        direction: entry.direction,
+        amount: entry.amount,
+        currency,
+      }));
 
       const transaction = await uow.insertTransaction({
         id: deps.newId(),
@@ -100,6 +99,7 @@ export async function postTransaction(
         requestHash,
         description: draft.description,
         occurredAt: draft.occurredAt,
+        reversesTransactionId: null,
         entries,
       });
 

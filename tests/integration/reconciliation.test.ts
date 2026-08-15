@@ -161,6 +161,94 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
     assertFlagged(report, "NEGATIVE_BALANCE", overdrawn, "type=asset balance=-7500");
   });
 
+  /**
+   * A correction that does not correct is worse than none: the ledger reads as settled
+   * while the original error stays in force. The mirror trigger refuses this at COMMIT,
+   * so the only way to hold one is never to commit -- which is exactly how it gets here.
+   */
+  it("finds a reversal that is not the mirror of what it claims to undo", async () => {
+    const reversalId = newId();
+    const report = await auditInsideRolledBackTransaction(async (client) => {
+      const left = await createAccount(client, "USD", true);
+      const right = await createAccount(client, "USD", true);
+
+      const originalId = newId();
+      await insertHeader(client, originalId);
+      await insertEntry(client, originalId, left, "USD", "debit", 1_000n);
+      await insertEntry(client, originalId, right, "USD", "credit", 1_000n);
+
+      await insertHeader(client, reversalId, originalId);
+      await insertEntry(client, reversalId, left, "USD", "credit", 900n);
+      await insertEntry(client, reversalId, right, "USD", "debit", 900n);
+    });
+
+    const check = checkNamed(report, "REVERSAL_INTEGRITY");
+    const anomaly = check.samples.find((candidate) => candidate.subject === reversalId);
+    assert.ok(anomaly !== undefined, "the audit did not flag the false correction");
+    assert.match(anomaly.detail, /problem=not_a_mirror/);
+
+    assert.equal(
+      checkNamed(report, "TRANSACTION_NET").samples.some(
+        (candidate) => candidate.subject === reversalId,
+      ),
+      false,
+      "it balances perfectly on its own; only the comparison with the original exposes it",
+    );
+  });
+
+  it("finds a reversal whose target was itself a reversal", async () => {
+    const secondReversalId = newId();
+    const report = await auditInsideRolledBackTransaction(async (client) => {
+      const left = await createAccount(client, "USD", true);
+      const right = await createAccount(client, "USD", true);
+
+      const originalId = newId();
+      await insertHeader(client, originalId);
+      await insertEntry(client, originalId, left, "USD", "debit", 500n);
+      await insertEntry(client, originalId, right, "USD", "credit", 500n);
+
+      const firstReversalId = newId();
+      await insertHeader(client, firstReversalId, originalId);
+      await insertEntry(client, firstReversalId, left, "USD", "credit", 500n);
+      await insertEntry(client, firstReversalId, right, "USD", "debit", 500n);
+
+      await insertHeader(client, secondReversalId, firstReversalId);
+      await insertEntry(client, secondReversalId, left, "USD", "debit", 500n);
+      await insertEntry(client, secondReversalId, right, "USD", "credit", 500n);
+    });
+
+    const anomaly = checkNamed(report, "REVERSAL_INTEGRITY").samples.find(
+      (candidate) => candidate.subject === secondReversalId,
+    );
+    assert.ok(anomaly !== undefined, "a chain of reversals went unnoticed");
+    assert.match(anomaly.detail, /problem=original_is_itself_a_reversal/);
+  });
+
+  it("says nothing about a true reversal", async () => {
+    const reversalId = newId();
+    const report = await auditInsideRolledBackTransaction(async (client) => {
+      const left = await createAccount(client, "USD", true);
+      const right = await createAccount(client, "USD", true);
+
+      const originalId = newId();
+      await insertHeader(client, originalId);
+      await insertEntry(client, originalId, left, "USD", "debit", 2_500n);
+      await insertEntry(client, originalId, right, "USD", "credit", 2_500n);
+
+      await insertHeader(client, reversalId, originalId);
+      await insertEntry(client, reversalId, left, "USD", "credit", 2_500n);
+      await insertEntry(client, reversalId, right, "USD", "debit", 2_500n);
+    });
+
+    for (const check of report.checks) {
+      assert.equal(
+        check.samples.some((anomaly) => anomaly.subject === reversalId),
+        false,
+        `${check.id} flagged a correct reversal`,
+      );
+    }
+  });
+
   it("says nothing about a transaction that is correct in every way", async () => {
     const transactionId = newId();
     const report = await auditInsideRolledBackTransaction(async (client) => {
@@ -191,7 +279,7 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
     const reader = createReconciliationReader(integrationAuditorUrl ?? "");
     try {
       const report = await reader.read((source) => reconcile({ source, now: () => new Date() }));
-      assert.equal(report.checks.length, 6);
+      assert.equal(report.checks.length, 7);
       assert.ok(report.size.accounts > 0n, "the suite has left accounts behind to audit");
       assert.ok(report.finishedAt.getTime() >= report.startedAt.getTime());
     } finally {
@@ -231,11 +319,16 @@ async function createAccount(
   return id;
 }
 
-async function insertHeader(client: pg.PoolClient, transactionId: string): Promise<void> {
+async function insertHeader(
+  client: pg.PoolClient,
+  transactionId: string,
+  reverses: string | null = null,
+): Promise<void> {
   await client.query(
-    `insert into transactions (id, idempotency_key, request_hash, description, occurred_at)
-     values ($1, $2, 'audit', 'never committed', now())`,
-    [transactionId, `audit-${transactionId}`],
+    `insert into transactions
+       (id, idempotency_key, request_hash, description, occurred_at, reverses_transaction_id)
+     values ($1, $2, 'audit', 'never committed', now(), $3)`,
+    [transactionId, `audit-${transactionId}`, reverses],
   );
 }
 

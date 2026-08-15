@@ -67,10 +67,24 @@ export async function reconcile(deps: ReconcileDependencies): Promise<Reconcilia
     // The one invariant with no database backstop at all: nothing but the balance check
     // inside the write lock stops an account from going below zero, so nothing but this
     // would notice if a write ever went around it.
+    // Deliberately makes no exception for reversals, even though a reversal is allowed to
+    // push an account below zero. The hole a correction leaves is real money that is
+    // really missing -- the funds were spent before the mistake was found -- so an audit
+    // that stayed quiet about it would be hiding the one thing a person has to act on.
+    // What a reversal changes is that the cause is on the record, not that the shortfall
+    // stops counting.
     result(
       "NEGATIVE_BALANCE",
       "accounts below zero that are not allowed to be",
       await deps.source.overdrawnAccounts(SAMPLE_LIMIT),
+    ),
+    // Corrections are the only way to fix a posting, so a correction that does not
+    // correct is worse than no correction at all: it reads as settled while leaving the
+    // original error in force.
+    result(
+      "REVERSAL_INTEGRITY",
+      "reversals that do not exactly mirror what they claim to undo",
+      await deps.source.brokenReversals(SAMPLE_LIMIT),
     ),
   ];
 

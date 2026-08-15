@@ -24,6 +24,20 @@ export function signedAmount(direction: Direction, amount: Amount): bigint {
   return direction === "debit" ? amount : -amount;
 }
 
+/**
+ * The other side of the same posting. Undoing a debit is crediting the same amount to the
+ * same account, never a debit of a negative one -- which the type system would not allow
+ * anyway, and the schema would refuse.
+ *
+ * The database holds this rule too, as flip_direction(). Two copies of one rule is a risk
+ * worth naming: they are two lines that say the same thing, and the reconciliation job
+ * compares postings written by one against postings judged by the other, so a drift would
+ * surface as an audit failure rather than as silence.
+ */
+export function flip(direction: Direction): Direction {
+  return direction === "debit" ? "credit" : "debit";
+}
+
 /** Renders 12345 as "123.45" for a currency with minorUnit 2. Presentation only. */
 export function format(amount: Amount, currency: Currency): string {
   const negative = amount < 0n;

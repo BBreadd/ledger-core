@@ -9,7 +9,7 @@
 // broken" are different incidents with different responses, and collapsing them means
 // a failing auditor reads as a failing ledger forever.
 
-import { loadConfig } from "../config.ts";
+import { requireDatabaseUrl } from "../config.ts";
 import { createReconciliationReader } from "../adapters/postgres/reconciliation-source.ts";
 import { reconcile } from "../application/reconcile.ts";
 import { isClean, reportLines } from "../domain/reconciliation.ts";
@@ -17,8 +17,9 @@ import { isClean, reportLines } from "../domain/reconciliation.ts";
 const EXIT_ANOMALIES_FOUND = 2;
 
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const reader = createReconciliationReader(config.databaseUrl);
+  // A role that holds SELECT and nothing else. The read-only transaction says the audit
+  // will not write; this says it could not have.
+  const reader = createReconciliationReader(requireDatabaseUrl("DATABASE_AUDITOR_URL"));
 
   try {
     const report = await reader.read((source) => reconcile({ source, now: () => new Date() }));

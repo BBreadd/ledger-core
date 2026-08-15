@@ -2,7 +2,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "../config.ts";
+import { requireDatabaseUrl } from "../config.ts";
 import { migrate } from "../adapters/postgres/migrator.ts";
 
 const MIGRATIONS_DIR = path.resolve(
@@ -11,8 +11,9 @@ const MIGRATIONS_DIR = path.resolve(
 );
 
 async function main(): Promise<void> {
-  const config = loadConfig();
-  const results = await migrate(config.databaseUrl, MIGRATIONS_DIR);
+  // The owner, not the application. Migrations create roles and hand out privileges,
+  // which is exactly the authority the application is not supposed to hold.
+  const results = await migrate(requireDatabaseUrl("DATABASE_ADMIN_URL"), MIGRATIONS_DIR);
 
   for (const result of results) {
     console.log(`${result.alreadyApplied ? "already applied" : "applied        "}  ${result.version}`);

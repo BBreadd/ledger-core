@@ -13,7 +13,7 @@ works but that there are tests showing what breaks when the safeguards are remov
 |---|---|
 | Every transaction's debits equal its credits | Types, a deferred constraint trigger, and the reconciliation job |
 | A transaction has at least two entries across at least two accounts | Deferred constraint trigger |
-| Postings are never updated or deleted | Corrections are reversing entries, not edits |
+| Postings are never updated or deleted | The application role holds no `UPDATE` or `DELETE`. Corrections are reversing entries |
 | A balance is never a stored, authoritative value | It is `sum(signed_amount)`; there is no balance column |
 | A retry with the same idempotency key posts once | `unique (idempotency_key)` |
 | The same key with a different payload is an error, not a replay | A stored fingerprint of the request |
@@ -36,6 +36,30 @@ account row is used as an exclusion token; it is never modified.
 `tests/integration/concurrency.test.ts` contains both halves: a test that reproduces the
 overdraft with the lock removed, and a test that shows the real path refusing the second
 withdrawal.
+
+## Roles
+
+Three connection strings, because one would mean one set of privileges:
+
+| Variable | Role | May |
+|---|---|---|
+| `DATABASE_ADMIN_URL` | the owner | everything; runs migrations and provisioning |
+| `DATABASE_URL` | the application | `SELECT`, `INSERT` |
+| `DATABASE_AUDITOR_URL` | the reconciliation job | `SELECT` |
+
+There is no `REVOKE` anywhere in the migrations, and that is the mechanism rather than an
+oversight: a new role holds no privileges at all and `PUBLIC` holds none on these tables,
+so immutability comes from never granting `UPDATE` or `DELETE`. Revoking a privilege nobody
+was given would read as protection while doing nothing.
+
+`ledger_app` and `ledger_auditor` are `NOLOGIN` groups created by the migration, which
+settles what each role may do and never who may become one. `provision` creates the
+identities that connect and adds them to a group, so a database that has only been migrated
+has no new way into it and no credential ever lives in a migration file.
+
+None of this means anything from a superuser connection, since a superuser bypasses
+privilege checks entirely -- so `tests/integration/permissions.test.ts` asserts that
+`DATABASE_URL` is not one before asserting anything else.
 
 ## Reconciliation
 
@@ -102,10 +126,14 @@ seeded in tests.
 docker compose up -d
 cp .env.example .env
 npm install
-npm run migrate
+npm run migrate      # schema, and the roles' privileges
+npm run provision    # lets the roles the connection strings name actually log in
 npm run demo
 npm run reconcile
 ```
+
+`provision` runs after `migrate` and not before: the groups its logins join have to exist
+first. Both are idempotent, so running either again does nothing.
 
 `npm run demo` walks the whole path against the real database: it opens accounts, funds
 one, transfers between two, replays the transfer as a retry would send it, then shows the

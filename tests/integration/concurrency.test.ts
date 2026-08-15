@@ -7,7 +7,11 @@ import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import type { PostOutcome } from "../../src/application/post-transaction.ts";
-import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
+import {
+  integrationAdminUrl,
+  integrationDatabaseUrl,
+  skipWithoutDatabase,
+} from "./database-url.ts";
 
 const newId = createUuidV7();
 
@@ -19,9 +23,16 @@ describe(
     const store = createLedgerStore(url);
     const pool = new pg.Pool({ connectionString: url });
 
+    // Deleting a posting is not something the application may do, by design. Undoing a
+    // violation this file commits on purpose is therefore the owner's job, and needing a
+    // second connection to do it is the permission model working rather than getting in
+    // the way.
+    const admin = new pg.Pool({ connectionString: integrationAdminUrl ?? "" });
+
     after(async () => {
       await store.close();
       await pool.end();
+      await admin.end();
     });
 
     /**
@@ -68,7 +79,7 @@ describe(
         const balance = await store.balanceOf(checking);
         assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
       } finally {
-        await erase(pool, [checking, revenue]);
+        await erase(admin, [checking, revenue]);
       }
     });
 
@@ -190,9 +201,8 @@ async function seedAccounts(
  * audit running in another file could snapshot it and report transactions with no
  * entries that never existed for anyone.
  *
- * Deleting postings is not something the application may do; it is something this test
- * has to do to undo a violation it created on purpose. Once the ledger role loses DELETE,
- * tests keep this ability only by connecting as the owner.
+ * Takes the owner's pool, not the application's: DELETE on entries is a privilege the
+ * application does not hold and `tests/integration/permissions.test.ts` proves it.
  */
 async function erase(pool: pg.Pool, accountIds: readonly string[]): Promise<void> {
   const client = await pool.connect();

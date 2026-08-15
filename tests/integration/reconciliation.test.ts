@@ -11,7 +11,11 @@ import {
 import { reconcile } from "../../src/application/reconcile.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
 import type { CheckId, ReconciliationReport } from "../../src/domain/reconciliation.ts";
-import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
+import {
+  integrationAuditorUrl,
+  integrationDatabaseUrl,
+  skipWithoutDatabase,
+} from "./database-url.ts";
 
 const newId = createUuidV7();
 
@@ -160,11 +164,11 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
   it("says nothing about a transaction that is correct in every way", async () => {
     const transactionId = newId();
     const report = await auditInsideRolledBackTransaction(async (client) => {
-      const source = await createAccount(client, "USD");
+      // The credited account allows going negative, so it funds the other from nothing.
+      const source = await createAccount(client, "USD", true);
       const destination = await createAccount(client, "USD");
       await insertHeader(client, transactionId);
-      // Credited account allows going negative, so it funds the other from nothing.
-      await insertEntry(client, transactionId, source, "USD", "credit", 2_000n, true);
+      await insertEntry(client, transactionId, source, "USD", "credit", 2_000n);
       await insertEntry(client, transactionId, destination, "USD", "debit", 2_000n);
     });
 
@@ -184,7 +188,7 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
    * once the suite has finished.
    */
   it("runs against the real database inside a read-only snapshot", async () => {
-    const reader = createReconciliationReader(url);
+    const reader = createReconciliationReader(integrationAuditorUrl ?? "");
     try {
       const report = await reader.read((source) => reconcile({ source, now: () => new Date() }));
       assert.equal(report.checks.length, 6);
@@ -196,7 +200,7 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
   });
 
   it("refuses to write through the auditor's connection", async () => {
-    const reader = createReconciliationReader(url);
+    const reader = createReconciliationReader(integrationAuditorUrl ?? "");
     try {
       await assert.rejects(
         reader.read(async () => {
@@ -211,12 +215,18 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
   });
 });
 
-async function createAccount(client: pg.PoolClient, currency: string): Promise<string> {
+async function createAccount(
+  client: pg.PoolClient,
+  currency: string,
+  allowsNegative = false,
+): Promise<string> {
   const id = newId();
+  // Set at creation rather than updated afterwards: UPDATE on accounts is a privilege the
+  // application role does not have, and these fixtures run as the application.
   await client.query(
     `insert into accounts (id, name, type, currency, allows_negative)
-     values ($1, $2, 'asset', $3, false)`,
-    [id, `audit fixture ${id}`, currency],
+     values ($1, $2, 'asset', $3, $4)`,
+    [id, `audit fixture ${id}`, currency, allowsNegative],
   );
   return id;
 }
@@ -236,11 +246,7 @@ async function insertEntry(
   currency: string,
   direction: "debit" | "credit",
   amount: bigint,
-  allowNegative = false,
 ): Promise<void> {
-  if (allowNegative) {
-    await client.query("update accounts set allows_negative = true where id = $1", [accountId]);
-  }
   await client.query(
     `insert into entries (id, transaction_id, account_id, currency, direction, amount)
      values ($1, $2, $3, $4, $5, $6::bigint)`,

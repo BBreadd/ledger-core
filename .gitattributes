@@ -1,0 +1,6 @@
+# Line endings are settled by the repository, not by each machine's core.autocrlf.
+#
+# `eol=lf` rather than `text=auto` alone: this repo is edited from Windows and also read
+# from a Linux mount, and a working tree that differs between the two makes `git status`
+# report every file as modified on one side while it is clean on the other.
+* text=auto eol=lf

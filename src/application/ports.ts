@@ -1,7 +1,7 @@
 // ports.ts -- the interfaces the core declares and the adapters implement. Depends on: domain.
 
 import type { AccountType } from "../domain/account.ts";
-import type { Amount, Direction } from "../domain/money.ts";
+import type { Amount, Currency, Direction } from "../domain/money.ts";
 import type { CheckFindings, LedgerSize } from "../domain/reconciliation.ts";
 
 export type NewAccount = {
@@ -107,6 +107,29 @@ export type LedgerStore = {
   findAccountBalance(accountId: string): Promise<AccountBalance | null>;
 
   findByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
+
+  /** The transaction with this id and all of its entries, or null if there is none. */
+  findTransaction(id: string): Promise<StoredTransaction | null>;
+
+  /**
+   * The currency, or null when the code is not one the ledger knows.
+   *
+   * Two things need this. Amounts travel as integer minor units, so a client cannot render
+   * one without knowing how many of them make a whole -- JPY has none, USD has two. And
+   * creating an account in an unknown currency has to be refused with something a caller
+   * can act on: without this read the insert reaches the foreign key on accounts.currency,
+   * comes back as SQLSTATE 23503, and a mistyped currency code becomes a 500.
+   */
+  findCurrency(code: string): Promise<Currency | null>;
+
+  /**
+   * Answers when the database answers. Used by the health check, so that "the process is
+   * up" and "the process can serve" are not the same claim -- a health check that returns
+   * 200 while the database is unreachable keeps a load balancer sending traffic to an
+   * instance that cannot do anything with it.
+   */
+  ping(): Promise<void>;
+
   close(): Promise<void>;
 };
 

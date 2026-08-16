@@ -126,6 +126,94 @@ The tests write it inside a transaction and audit it on the same connection with
 committing: the constraint triggers are deferred, so they fire at `COMMIT` and a
 transaction that never commits never fires them.
 
+## HTTP API
+
+```bash
+npm run serve      # PORT and API_TOKEN come from the environment
+```
+
+Six routes, one content type, no framework. `node:http` with a router and a parser written
+here, and no new runtime dependency — at five or six routes a framework buys routing, and
+routing is a list of at most four path segments compared for equality. The parts it would
+also have brought are written out instead, and they are the parts worth reading: a byte
+ceiling on the request body, explicit request and header timeouts, and an exhaustive
+mapping from every rejection the core can produce to a status code.
+
+| Route | |
+|---|---|
+| `POST /v1/accounts` | opens an account |
+| `POST /v1/transactions` | posts a transaction |
+| `GET /v1/transactions/{id}` | reads one back |
+| `POST /v1/transactions/{id}/reversal` | corrects one |
+| `GET /v1/accounts/{id}/balance` | the account's normal balance |
+| `GET /health` | answers only while the database does |
+
+Reversal is a sub-resource rather than `POST /v1/reversals` with the id in the body, so what
+is being undone is stated by the URL, and a second attempt is a conflict over that resource
+rather than a disagreement about a payload. `/v1` is in the path because a URL is a key to
+stored data in the same way an id is: version it late and clients break.
+
+**Every route except `/health` requires `Authorization: Bearer $API_TOKEN`.** That is
+authentication and not authorization: there is no model of which caller may touch which
+account, because the domain has no notion of ownership and inventing one here would be
+building something nobody asked for. Anyone with the token can do anything the API offers.
+Closing that gap means identities, ownership of accounts, and a migration — a project of its
+own, and this line is here so that its absence is a stated limit rather than something a
+reader has to discover.
+
+**Writes require an `Idempotency-Key` header**, quoted or bare — the IETF draft asks for a
+Structured Header, the industry sends it plain, and rejecting half the clients over
+punctuation would serve nobody. The draft's 409 for "a request with this key is still in
+flight" is not implemented, because it cannot happen here: two identical POSTs at once are
+serialised by the unique index, the second blocking on it until the first commits and then
+losing the insert with `23505`, which is a replay. There is no retry loop and no
+check-then-insert anywhere on that path.
+
+`occurredAt` is required in the body, and the reason is easy to get wrong. The request
+fingerprint includes it, so defaulting it to the current time would give a client's retry a
+different timestamp, a different hash, and therefore a rejection for reusing its key —
+breaking idempotency for exactly the caller relying on it.
+
+**Amounts travel as strings of minor units** (`"50000"`), with `currency` and `minorUnit`
+beside them. A JSON number loses precision above 2^53, a decimal string puts rounding back
+into runtime, and a bigint cannot be serialised at all — `JSON.stringify` throws on one.
+Balances are presented as the account's normal balance, so a revenue account holding 500
+reads as `"50000"` and not as the debit-positive `-50000` the column stores.
+
+Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem documents, and the
+core's rejection codes are part of the public contract:
+
+```json
+{
+  "type": "urn:ledger-core:error:insufficient-funds",
+  "title": "Insufficient funds",
+  "status": 422,
+  "detail": "account 0198... would go to -4000 (balance 46000, type asset)",
+  "code": "INSUFFICIENT_FUNDS"
+}
+```
+
+A client told `{"error": "internal"}` when it was short of funds cannot tell "fix the
+request" from "retry later", so refusals travel with their own code while anything
+unexpected collapses to a 500 carrying a request id, with the stack going to the log. The
+table that maps code to status is a `Record` over the union of every rejection code in the
+core, which means adding one without deciding what it means over HTTP fails `npm run
+typecheck` rather than quietly falling through to a 500.
+
+`UNKNOWN_ACCOUNT` is a 422 and not a 404 on purpose: `POST /v1/transactions` does exist, and
+what is missing is an account named inside the body. `UNKNOWN_TRANSACTION` on the reversal
+route is a 404, because there the id is the URL.
+
+Two things about running it in production:
+
+- **Start it as `node src/entry/serve.ts`, not through `npm run serve`.** npm does not
+  forward `SIGTERM` to the process it spawned, so the graceful shutdown never runs and
+  in-flight requests are cut off. Measured: through npm the process dies on the signal;
+  directly, it logs `shutdown.started`, drains, and exits 0.
+- **Currencies are reference data and the migrations do not seed any.** A freshly migrated
+  database knows no currency, so every account creation is refused until one exists:
+  `insert into currencies (code, minor_unit) values ('USD', 2);` as the owner.
+
 ## Design notes
 
 **Money is `bigint` in minor units.** Floating point is excluded for the obvious reason.
@@ -165,6 +253,7 @@ npm run migrate      # schema, and the roles' privileges
 npm run provision    # lets the roles the connection strings name actually log in
 npm run demo
 npm run reconcile
+npm run serve        # the HTTP surface, on PORT
 ```
 
 `provision` runs after `migrate` and not before: the groups its logins join have to exist
@@ -194,8 +283,8 @@ files, then reconciles the ledger the suite left behind.
 migrations/       versioned SQL; an applied migration is never edited
 src/domain/       entities and the pure double-entry rules. No I/O.
 src/application/  use cases and the ports they depend on
-src/adapters/     PostgreSQL, id generation
-src/entry/        composition roots: migrate, demo, reconcile
+src/adapters/     PostgreSQL, the HTTP surface, id generation
+src/entry/        composition roots: migrate, provision, demo, reconcile, serve
 tests/unit/       pure rules
 tests/integration/what the database refuses, the concurrency proofs, the audit
 ```
@@ -204,9 +293,14 @@ Dependencies point inwards: `src/domain` does not know PostgreSQL exists.
 
 ## Not built yet
 
-An HTTP surface, multi-currency transactions with FX, and balance snapshots for accounts
-too large to sum. Balance snapshots are deliberately absent: caching a balance before
-measuring that summing is too slow would be optimising a problem nobody has shown exists.
+Authorization, multi-currency transactions with FX, and balance snapshots for accounts too
+large to sum. Balance snapshots are deliberately absent: caching a balance before measuring
+that summing is too slow would be optimising a problem nobody has shown exists.
+
+Creating an account is not idempotent. The core has no key for it — `POST /v1/accounts`
+takes no `Idempotency-Key`, and a retried request opens a second account. Making it
+idempotent needs the same unique-key mechanism transactions have, which is a migration, and
+requiring a header that the route would then ignore would be worse than saying this.
 
 One known gap, stated precisely because the obvious guess about it is wrong: appending a
 *balanced* pair of entries to an already-committed transaction is refused by nothing in the

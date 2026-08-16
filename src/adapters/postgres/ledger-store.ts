@@ -3,6 +3,7 @@
 import pg from "pg";
 import type { PoolClient, QueryResultRow } from "pg";
 import type {
+  AccountBalance,
   LedgerStore,
   LockedAccount,
   NewAccount,
@@ -83,15 +84,33 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
       );
     },
 
-    async balanceOf(accountId: string): Promise<bigint> {
-      const result = await pool.query<{ balance: unknown }>(
-        `select coalesce(sum(signed_amount), 0)::bigint as balance
-           from entries
-          where account_id = $1`,
+    async findAccountBalance(accountId: string): Promise<AccountBalance | null> {
+      // Driven from accounts with a LEFT JOIN rather than aggregating entries, so that an
+      // account with no entries yet comes back as zero while an id that was never created
+      // comes back as nothing. Aggregating entries alone answers both with zero.
+      const result = await pool.query<AccountBalanceRow>(
+        `select a.id,
+                a.type,
+                a.currency,
+                coalesce(sum(e.signed_amount), 0)::bigint as balance
+           from accounts a
+           left join entries e on e.account_id = a.id
+          where a.id = $1
+          group by a.id, a.type, a.currency`,
         [accountId],
       );
+
       const row = result.rows[0];
-      return row === undefined ? 0n : toBigInt(row.balance, "balance");
+      if (row === undefined) {
+        return null;
+      }
+
+      return {
+        id: row.id,
+        type: row.type,
+        currency: row.currency.trim(),
+        balance: toBigInt(row.balance, "balance"),
+      };
     },
 
     findByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
@@ -210,6 +229,13 @@ type AccountRow = {
   type: AccountType;
   currency: string;
   allows_negative: boolean;
+  balance: unknown;
+};
+
+type AccountBalanceRow = QueryResultRow & {
+  id: string;
+  type: AccountType;
+  currency: string;
   balance: unknown;
 };
 

@@ -160,29 +160,28 @@ export function createReconciliationSource(client: ClientBase): ReconciliationSo
     },
 
     /**
-     * The predicate is the raw signed sum, deliberately identical to the one the write
-     * path applies inside its lock. An auditor that judges by a different rule than the
-     * enforcer reports failures nobody can cause and misses the ones they can, which is
-     * worse than either rule alone.
+     * The predicate is normal_balance(), deliberately identical to the one the write path
+     * applies inside its lock. An auditor that judges by a different rule than the enforcer
+     * reports failures nobody can cause and misses the ones they can, which is worse than
+     * either rule alone -- so this query and accountsLeftOverdrawn change together or not
+     * at all.
      *
-     * Worth knowing that the shared rule is debit-normal: for a credit-normal account a
-     * healthy balance is a negative signed sum, so allows_negative = false on a revenue
-     * or liability account means "can never be credited on net", which is not what anyone
-     * would mean by it. That is a question about the rule, not about this check, and it
-     * gets answered in one place or in neither.
+     * Both the reported balance and the predicate are in normal-balance terms, because a
+     * finding that says balance=-50000 about an account holding 50000 is a lie even when
+     * the row it points at is the right one.
      */
     overdrawnAccounts(limit: number): Promise<CheckFindings> {
       return findings(
         client,
-        `select a.id::text                                as subject,
-                a.type::text                              as type,
-                coalesce(sum(e.signed_amount), 0)::bigint as balance,
-                count(*) over ()                          as anomaly_total
+        `select a.id::text as subject,
+                a.type::text as type,
+                normal_balance(a.type, coalesce(sum(e.signed_amount), 0)::bigint) as balance,
+                count(*) over () as anomaly_total
            from accounts a
            left join entries e on e.account_id = a.id
           where not a.allows_negative
           group by a.id, a.type
-         having coalesce(sum(e.signed_amount), 0) < 0
+         having normal_balance(a.type, coalesce(sum(e.signed_amount), 0)::bigint) < 0
           order by a.id
           limit $1`,
         [limit],

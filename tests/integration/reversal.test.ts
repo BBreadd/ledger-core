@@ -64,7 +64,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     const destination = await account(false);
     const original = await post(source, destination, 4_200n);
 
-    assert.equal(await store.balanceOf(destination), 4_200n);
+    assert.equal((await store.findAccountBalance(destination))?.balance, 4_200n);
 
     const outcome = await reverseTransaction(deps, {
       transactionId: original.id,
@@ -78,8 +78,12 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     }
 
     assert.equal(outcome.transaction.reversesTransactionId, original.id);
-    assert.equal(await store.balanceOf(destination), 0n, "the pair cancels on every account");
-    assert.equal(await store.balanceOf(source), 0n);
+    assert.equal(
+      (await store.findAccountBalance(destination))?.balance,
+      0n,
+      "the pair cancels on every account",
+    );
+    assert.equal((await store.findAccountBalance(source))?.balance, 0n);
 
     const directions = outcome.transaction.entries.map((entry) => ({
       accountId: entry.accountId,
@@ -233,7 +237,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
 
     const funding = await post(revenue, checking, 10_000n);
     await post(checking, elsewhere, 10_000n);
-    assert.equal(await store.balanceOf(checking), 0n, "the money has been spent");
+    assert.equal((await store.findAccountBalance(checking))?.balance, 0n, "the money has been spent");
 
     // A plain withdrawal at this point is refused, which is what makes the next line
     // meaningful rather than a demonstration that nothing was being enforced.
@@ -256,7 +260,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
       });
 
       assert.equal(outcome.status, "reversed", "a correction is not subject to the floor");
-      assert.equal(await store.balanceOf(checking), -10_000n);
+      assert.equal((await store.findAccountBalance(checking))?.balance, -10_000n);
     } finally {
       // The shortfall is genuine, so the audit would report it forever. Cleared here for
       // the same reason the write-skew demonstration clears its overdraft: a test must not

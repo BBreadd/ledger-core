@@ -76,7 +76,7 @@ describe(
       // that every future audit reports and nobody caused. A test that commits a
       // deliberate violation and walks away turns the auditor into a liar.
       try {
-        const balance = await store.balanceOf(checking);
+        const balance = (await store.findAccountBalance(checking))?.balance;
         assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
       } finally {
         await erase(admin, [checking, revenue]);
@@ -117,7 +117,7 @@ describe(
       assert.equal(rejected[0]?.status === "rejected" && rejected[0].rejections[0]?.code,
         "INSUFFICIENT_FUNDS");
 
-      const balance = await store.balanceOf(checking);
+      const balance = (await store.findAccountBalance(checking))?.balance;
       assert.equal(balance, 4_000n, "the account never goes below zero");
     });
 

@@ -10,6 +10,7 @@ import {
 } from "../../src/adapters/postgres/reconciliation-source.ts";
 import { reconcile } from "../../src/application/reconcile.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import type { AccountType } from "../../src/domain/account.ts";
 import type { CheckId, ReconciliationReport } from "../../src/domain/reconciliation.ts";
 import {
   integrationAuditorUrl,
@@ -162,6 +163,51 @@ describe("the reconciliation job", { skip: skipWithoutDatabase }, () => {
   });
 
   /**
+   * Stored sums are debit-positive, so a revenue account doing exactly what revenue does
+   * carries a negative one. Judging it by raw sign would report every healthy income
+   * account in the ledger as overdrawn -- an auditor crying wolf about the normal case,
+   * which is how people learn to ignore an auditor.
+   */
+  it("leaves a credit-normal account alone when its balance is healthy", async () => {
+    const transactionId = newId();
+    let revenue = "";
+    const report = await auditInsideRolledBackTransaction(async (client) => {
+      revenue = await createAccount(client, "USD", false, "revenue");
+      const cash = await createAccount(client, "USD");
+      await insertHeader(client, transactionId);
+      await insertEntry(client, transactionId, revenue, "USD", "credit", 7_500n);
+      await insertEntry(client, transactionId, cash, "USD", "debit", 7_500n);
+    });
+
+    assert.equal(
+      checkNamed(report, "NEGATIVE_BALANCE").samples.some(
+        (anomaly) => anomaly.subject === revenue,
+      ),
+      false,
+      "a revenue account holding 7500 has a stored sum of -7500 and is not overdrawn",
+    );
+  });
+
+  /**
+   * The other half of the same rule, and the half that proves the first one is not simply
+   * exempting credit-normal accounts. Revenue net-debit is a real hole, and it is reported
+   * in the direction a reader expects: 7500 short, not -7500 of something.
+   */
+  it("finds a credit-normal account that has gone the wrong way", async () => {
+    const transactionId = newId();
+    let revenue = "";
+    const report = await auditInsideRolledBackTransaction(async (client) => {
+      revenue = await createAccount(client, "USD", false, "revenue");
+      const cash = await createAccount(client, "USD", true);
+      await insertHeader(client, transactionId);
+      await insertEntry(client, transactionId, revenue, "USD", "debit", 7_500n);
+      await insertEntry(client, transactionId, cash, "USD", "credit", 7_500n);
+    });
+
+    assertFlagged(report, "NEGATIVE_BALANCE", revenue, "type=revenue balance=-7500");
+  });
+
+  /**
    * A correction that does not correct is worse than none: the ledger reads as settled
    * while the original error stays in force. The mirror trigger refuses this at COMMIT,
    * so the only way to hold one is never to commit -- which is exactly how it gets here.
@@ -307,14 +353,15 @@ async function createAccount(
   client: pg.PoolClient,
   currency: string,
   allowsNegative = false,
+  type: AccountType = "asset",
 ): Promise<string> {
   const id = newId();
   // Set at creation rather than updated afterwards: UPDATE on accounts is a privilege the
   // application role does not have, and these fixtures run as the application.
   await client.query(
     `insert into accounts (id, name, type, currency, allows_negative)
-     values ($1, $2, 'asset', $3, $4)`,
-    [id, `audit fixture ${id}`, currency, allowsNegative],
+     values ($1, $2, $3, $4, $5)`,
+    [id, `audit fixture ${id}`, type, currency, allowsNegative],
   );
   return id;
 }

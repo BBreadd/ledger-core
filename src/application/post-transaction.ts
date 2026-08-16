@@ -3,6 +3,7 @@
 import type { TransactionDraft, ViolationCode } from "../domain/transaction.ts";
 import { fingerprint, validate } from "../domain/transaction.ts";
 import { signedAmount } from "../domain/money.ts";
+import { normalBalance } from "../domain/account.ts";
 import type {
   IdGenerator,
   LedgerStore,
@@ -139,6 +140,14 @@ async function replayOrReject(
 /**
  * Net effect per account, so that a transaction which both debits and credits the same
  * account is judged on the result rather than on one leg of it.
+ *
+ * The floor is applied to the normal balance, not to the raw stored sum. Stored sums are
+ * debit-positive, so for a liability, equity or revenue account a healthy balance is a
+ * negative sum: judging those by raw sign would read allows_negative = false as "may never
+ * be credited on net", which is the opposite of what it should mean. The auditor applies
+ * the same rule through normal_balance() in SQL, and it has to stay that way -- an auditor
+ * judging by a different rule than the enforcer reports failures nobody can cause and
+ * misses the ones they can.
  */
 function accountsLeftOverdrawn(
   byId: ReadonlyMap<string, LockedAccount>,
@@ -156,10 +165,11 @@ function accountsLeftOverdrawn(
     if (account === undefined || account.allowsNegative) {
       continue;
     }
-    const after = account.balance + delta;
+    const after = normalBalance(account.type, account.balance + delta);
     if (after < 0n) {
       problems.push(
-        `account ${accountId} would go to ${after} (balance ${account.balance}, change ${delta})`,
+        `account ${accountId} would go to ${after} ` +
+          `(balance ${normalBalance(account.type, account.balance)}, type ${account.type})`,
       );
     }
   }

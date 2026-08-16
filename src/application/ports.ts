@@ -21,6 +21,22 @@ export type LockedAccount = {
   readonly balance: bigint;
 };
 
+/**
+ * An account and what it holds. `balance` is the stored sum, debit-positive like every
+ * other number in the schema: turning it into what a reader expects to see is
+ * normalBalance()'s job, and it belongs to whoever presents it, not to the data.
+ *
+ * The type travels with the balance because no caller can read the number correctly
+ * without it, and a port that hands out a bare bigint forces every caller to go find the
+ * account type somewhere else -- or, worse, to hardcode it.
+ */
+export type AccountBalance = {
+  readonly id: string;
+  readonly type: AccountType;
+  readonly currency: string;
+  readonly balance: bigint;
+};
+
 export type StoredEntry = {
   readonly id: string;
   readonly accountId: string;
@@ -81,7 +97,15 @@ export type LedgerStore = {
 
   createAccount(account: NewAccount): Promise<void>;
   ensureCurrency(code: string, minorUnit: number): Promise<void>;
-  balanceOf(accountId: string): Promise<bigint>;
+
+  /**
+   * The account with its balance, or null when there is no such account. The null matters:
+   * summing an empty set of entries and summing the entries of an account that does not
+   * exist both produce zero, and a caller that cannot tell those apart reports a balance
+   * of zero for an id nobody ever created.
+   */
+  findAccountBalance(accountId: string): Promise<AccountBalance | null>;
+
   findByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
   close(): Promise<void>;
 };

@@ -22,7 +22,7 @@ works but that there are tests showing what breaks when the safeguards are remov
 | The same key with a different payload is an error, not a replay | A stored fingerprint of the request |
 | An entry cannot be in a currency its account does not hold | Composite foreign key `(account_id, currency)` |
 | Amounts are strictly positive | `check (amount > 0)` |
-| An account marked non-negative never goes below zero | Checked inside a row lock |
+| An account marked non-negative never goes below zero, read in its own direction | Checked inside a row lock, and audited afterwards with the same rule |
 
 ## The concurrency problem
 
@@ -112,7 +112,10 @@ Three of the checks are worth singling out:
   error a single total cannot see.
 - **Accounts below zero.** The only rule here with no database backstop at all: nothing but
   a check inside the write lock enforces it, so nothing but this would notice a write that
-  went around it.
+  went around it. It judges the normal balance, not the raw stored sum, using the same
+  `normal_balance()` the write path applies — stored sums are debit-positive, so a revenue
+  account doing exactly what revenue does carries a negative one, and an auditor reading it
+  by raw sign would flag every healthy income account in the ledger.
 - **Reversal integrity.** A reversal that is not the exact mirror of its original balances
   perfectly on its own, so every other check passes it. Only the comparison against what it
   claims to undo exposes it — and a correction that does not correct is worse than none,

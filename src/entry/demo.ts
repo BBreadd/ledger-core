@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     });
     await store.createAccount({
       id: revenue, name: `Revenue ${run}`, type: "revenue",
-      currency: "USD", allowsNegative: true,
+      currency: "USD", allowsNegative: false,
     });
 
     console.log(`run ${run}\n`);
@@ -136,9 +136,9 @@ async function main(): Promise<void> {
     );
 
     console.log("\nbalances");
-    await printBalance(store, "checking", checking, "asset");
-    await printBalance(store, "savings ", savings, "asset");
-    await printBalance(store, "revenue ", revenue, "revenue");
+    await printBalance(store, "checking", checking);
+    await printBalance(store, "savings ", savings);
+    await printBalance(store, "revenue ", revenue);
   } finally {
     await store.close();
   }
@@ -173,14 +173,13 @@ async function showReversal(outcome: Promise<ReverseOutcome>): Promise<void> {
   );
 }
 
-async function printBalance(
-  store: LedgerStore,
-  label: string,
-  accountId: string,
-  type: "asset" | "revenue",
-): Promise<void> {
-  const stored = await store.balanceOf(accountId);
-  console.log(`   ${label}  ${format(normalBalance(type, stored), USD)}`);
+async function printBalance(store: LedgerStore, label: string, accountId: string): Promise<void> {
+  const account = await store.findAccountBalance(accountId);
+  if (account === null) {
+    console.log(`   ${label}  no such account`);
+    return;
+  }
+  console.log(`   ${label}  ${format(normalBalance(account.type, account.balance), USD)}`);
 }
 
 await main();

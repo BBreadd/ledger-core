@@ -110,6 +110,37 @@ describe(
       );
     });
 
+    it("refuses entries appended to a transaction that is already committed", async () => {
+      const other = newId();
+      await pool.query(
+        `insert into accounts (id, name, type, currency, allows_negative)
+         values ($1, 'counterparty four', 'revenue', 'USD', true)`,
+        [other],
+      );
+
+      const committed = await writeRaw(pool, [
+        { accountId: usd, currency: "USD", direction: "debit", amount: 100n },
+        { accountId: other, currency: "USD", direction: "credit", amount: 100n },
+      ]);
+
+      // Balanced, so the transaction still sums to zero afterwards and every reconciliation
+      // check would go on passing. Nothing but the trigger stands between this and a
+      // rewritten posting.
+      await assert.rejects(
+        appendRaw(pool, committed, [
+          { accountId: usd, currency: "USD", direction: "debit", amount: 500n },
+          { accountId: other, currency: "USD", direction: "credit", amount: 500n },
+        ]),
+        /already committed/,
+      );
+
+      const legs = await pool.query<{ legs: number }>(
+        "select count(*)::int as legs from entries where transaction_id = $1",
+        [committed],
+      );
+      assert.equal(legs.rows[0]?.legs, 2);
+    });
+
     it("refuses to reuse an idempotency key", async () => {
       const other = newId();
       await pool.query(
@@ -145,7 +176,7 @@ async function writeRaw(
   pool: pg.Pool,
   entries: readonly RawEntry[],
   idempotencyKey?: string,
-): Promise<void> {
+): Promise<string> {
   const client = await pool.connect();
   const transactionId = newId();
   try {
@@ -169,6 +200,43 @@ async function writeRaw(
         ],
       );
     }
+    await client.query("commit");
+    return transactionId;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Adds entries to a transaction that already exists, in one statement, exactly the shape
+ * the adapter uses to write a posting. The only difference is that the header is not this
+ * transaction's to write.
+ */
+async function appendRaw(
+  pool: pg.Pool,
+  transactionId: string,
+  entries: readonly RawEntry[],
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await client.query(
+      `insert into entries (id, transaction_id, account_id, currency, direction, amount)
+       select *
+         from unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::bpchar[],
+                     $5::entry_direction[], $6::bigint[])`,
+      [
+        entries.map(() => newId()),
+        entries.map(() => transactionId),
+        entries.map((entry) => entry.accountId),
+        entries.map((entry) => entry.currency),
+        entries.map((entry) => entry.direction),
+        entries.map((entry) => entry.amount.toString()),
+      ],
+    );
     await client.query("commit");
   } catch (error) {
     await client.query("rollback");

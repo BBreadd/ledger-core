@@ -204,15 +204,10 @@ typecheck` rather than quietly falling through to a 500.
 what is missing is an account named inside the body. `UNKNOWN_TRANSACTION` on the reversal
 route is a 404, because there the id is the URL.
 
-Two things about running it in production:
-
-- **Start it as `node src/entry/serve.ts`, not through `npm run serve`.** npm does not
-  forward `SIGTERM` to the process it spawned, so the graceful shutdown never runs and
-  in-flight requests are cut off. Measured: through npm the process dies on the signal;
-  directly, it logs `shutdown.started`, drains, and exits 0.
-- **Currencies are reference data and the migrations do not seed any.** A freshly migrated
-  database knows no currency, so every account creation is refused until one exists:
-  `insert into currencies (code, minor_unit) values ('USD', 2);` as the owner.
+One thing about running it in production: **start it as `node src/entry/serve.ts`, not
+through `npm run serve`.** npm does not forward `SIGTERM` to the process it spawned, so the
+graceful shutdown never runs and in-flight requests are cut off. Measured: through npm the
+process dies on the signal; directly, it logs `shutdown.started`, drains, and exits 0.
 
 ## Design notes
 
@@ -258,6 +253,12 @@ npm run serve        # the HTTP surface, on PORT
 
 `provision` runs after `migrate` and not before: the groups its logins join have to exist
 first. Both are idempotent, so running either again does nothing.
+
+`migrate` also seeds the currencies the ledger knows: USD, EUR and GBP with two minor units,
+JPY with none, KWD with three. `accounts.currency` is a foreign key into that table, so a
+database with no rows in it refuses every account and therefore every transaction. The set is
+deliberately not all two-decimal — seeding only those would restate the "everything is cents"
+assumption `minor_unit` exists to break. Another currency is another migration.
 
 `npm run demo` walks the whole path against the real database: it opens accounts, funds
 one, transfers between two, replays the transfer as a retry would send it, then shows the

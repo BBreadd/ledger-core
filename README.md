@@ -14,6 +14,7 @@ works but that there are tests showing what breaks when the safeguards are remov
 | Every transaction's debits equal its credits | Types, a deferred constraint trigger, and the reconciliation job |
 | A transaction has at least two entries across at least two accounts | Deferred constraint trigger |
 | Postings are never updated or deleted | The application role holds no `UPDATE` or `DELETE`. Corrections are reversing entries |
+| A transaction's entries are fixed when it is written | A trigger refuses any entry whose transaction was committed by an earlier database transaction |
 | A reversal is the exact mirror of what it undoes | Built from the original, checked by a deferred trigger, audited afterwards |
 | A transaction is reversed at most once | `unique (reverses_transaction_id)` |
 | A reversal is not itself reversible | A deferred trigger; post the original again instead |
@@ -303,14 +304,24 @@ takes no `Idempotency-Key`, and a retried request opens a second account. Making
 idempotent needs the same unique-key mechanism transactions have, which is a migration, and
 requiring a header that the route would then ignore would be worse than saying this.
 
-One known gap, stated precisely because the obvious guess about it is wrong: appending a
-*balanced* pair of entries to an already-committed transaction is refused by nothing in the
-schema, and **the reconciliation job cannot catch it either**. The result balances by every
-check the job makes -- per transaction, per currency, globally -- because it genuinely does
-balance. It is a history that was rewritten, not a sum that stopped adding up, and no
-amount of summing distinguishes the two. Closing it means taking away the right to insert
-into a transaction that already exists, which is a question about roles and permissions
-rather than about arithmetic.
+Appending a *balanced* pair of entries to an already-committed transaction used to be
+refused by nothing, and it is worth keeping the reason in view: **the reconciliation job
+cannot catch that one**. The result balances by every check the job makes -- per
+transaction, per currency, globally -- because it genuinely does balance. It is a history
+that was rewritten, not a sum that stopped adding up, and no amount of summing
+distinguishes the two.
+
+Privileges cannot express it either. The application must hold `INSERT` on `entries` in
+order to write at all, and a `GRANT` has no way of saying "only into the transaction you
+are creating right now". So it is a trigger, and the question it asks is `xmin`: if the
+header was written by some earlier transaction rather than by this one, the insert is an
+append and it is refused. `tests/integration/invariants.test.ts` makes the attempt the way
+the adapter writes a posting, and removing the trigger turns that test red.
+
+What no trigger can defend against is the database owner, who can drop it -- or, with
+`session_replication_role = 'replica'`, step around every trigger at once. That is not a
+hole in this mechanism so much as the shape of the trust boundary: the owner runs the
+migrations, so nothing inside the schema can be authoritative against them.
 
 ## License
 

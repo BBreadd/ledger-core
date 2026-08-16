@@ -14,7 +14,7 @@ import type {
 } from "../../application/ports.ts";
 import { AlreadyReversedError, DuplicateIdempotencyKeyError } from "../../application/ports.ts";
 import type { AccountType } from "../../domain/account.ts";
-import type { Direction } from "../../domain/money.ts";
+import type { Currency, Direction } from "../../domain/money.ts";
 
 // node-postgres hands back int8 as a string, because not every int8 fits in a JS number.
 // Money lives in int8 columns, so the safe conversion is to bigint, never to number.
@@ -40,6 +40,15 @@ function toBigInt(value: unknown, column: string): bigint {
     return BigInt(value);
   }
   throw new TypeError(`column ${column} arrived as ${typeof value}, cannot read it as an integer`);
+}
+
+/** Same reasoning as toBigInt, for the one column that is small enough to be a number. */
+function toSmallInt(value: unknown, column: string): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed)) {
+    throw new TypeError(`column ${column} arrived as ${typeof value}, cannot read it as an integer`);
+  }
+  return parsed;
 }
 
 const UNIQUE_VIOLATION = "23505";
@@ -115,6 +124,28 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
 
     findByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
       return loadTransaction(pool, "idempotency_key", key);
+    },
+
+    findTransaction(id: string): Promise<StoredTransaction | null> {
+      return loadTransaction(pool, "id", id);
+    },
+
+    async findCurrency(code: string): Promise<Currency | null> {
+      const result = await pool.query<CurrencyRow>(
+        "select code, minor_unit from currencies where code = $1",
+        [code],
+      );
+
+      const row = result.rows[0];
+      if (row === undefined) {
+        return null;
+      }
+
+      return { code: row.code.trim(), minorUnit: toSmallInt(row.minor_unit, "minor_unit") };
+    },
+
+    async ping(): Promise<void> {
+      await pool.query("select 1");
     },
 
     async close(): Promise<void> {
@@ -230,6 +261,11 @@ type AccountRow = {
   currency: string;
   allows_negative: boolean;
   balance: unknown;
+};
+
+type CurrencyRow = QueryResultRow & {
+  code: string;
+  minor_unit: unknown;
 };
 
 type AccountBalanceRow = QueryResultRow & {

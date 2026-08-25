@@ -12,6 +12,8 @@
     "typecheck": "tsc --noEmit",
     "migrate": "node --env-file-if-exists=.env src/entry/migrate.ts",
     "provision": "node --env-file-if-exists=.env src/entry/provision.ts",
+    "issue-key": "node --env-file-if-exists=.env src/entry/issue-key.ts",
+    "revoke-key": "node --env-file-if-exists=.env src/entry/revoke-key.ts",
     "demo": "node --env-file-if-exists=.env src/entry/demo.ts",
     "serve": "node --env-file-if-exists=.env src/entry/serve.ts",
     "reconcile": "node --env-file-if-exists=.env src/entry/reconcile.ts",

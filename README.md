@@ -86,6 +86,11 @@ settles what each role may do and never who may become one. `provision` creates 
 identities that connect and adds them to a group, so a database that has only been migrated
 has no new way into it and no credential ever lives in a migration file.
 
+API credentials are split the same way one level up, for the same reason: a migration
+creates the tenants and settles that the application may only read `api_keys`, while
+`issue-key` mints the secrets. The application authenticates callers and cannot mint one --
+it holds `SELECT` on `api_keys` and nothing else, and nothing at all on `tenants`.
+
 None of this means anything from a superuser connection, since a superuser bypasses
 privilege checks entirely -- so `tests/integration/permissions.test.ts` asserts that
 `DATABASE_URL` is not one before asserting anything else.
@@ -130,7 +135,8 @@ transaction that never commits never fires them.
 ## HTTP API
 
 ```bash
-npm run serve      # PORT and API_TOKEN come from the environment
+npm run issue-key -- my-client   # prints a token, once
+npm run serve                    # PORT comes from the environment
 ```
 
 Six routes, one content type, no framework. `node:http` with a router and a parser written
@@ -154,13 +160,35 @@ is being undone is stated by the URL, and a second attempt is a conflict over th
 rather than a disagreement about a payload. `/v1` is in the path because a URL is a key to
 stored data in the same way an id is: version it late and clients break.
 
-**Every route except `/health` requires `Authorization: Bearer $API_TOKEN`.** That is
-authentication and not authorization: there is no model of which caller may touch which
-account, because the domain has no notion of ownership and inventing one here would be
-building something nobody asked for. Anyone with the token can do anything the API offers.
-Closing that gap means identities, ownership of accounts, and a migration — a project of its
-own, and this line is here so that its absence is a stated limit rather than something a
-reader has to discover.
+**Every route except `/health` requires `Authorization: Bearer <token>`.** A token is
+`lgr_<keyId>.<secret>`: the key id travels in front so that verifying one is a single lookup
+by primary key rather than a scan hashing the presented secret against every row, and the
+prefix is what makes a leaked secret findable by a fixed string. Only a SHA-256 digest of
+the secret is stored — a plain one, and deliberately, because slow password hashes exist to
+make guessing expensive for secrets a human chose and this one is 32 bytes of cryptographic
+randomness that no dictionary reaches.
+
+Credentials are rows, not an environment variable, and the three things that buys are the
+reason: every request log line names the caller, a key carries a scope, and `revoke-key`
+stops one working on the next request without restarting anything.
+
+| Scope | May call |
+|---|---|
+| `read` | the `GET` routes |
+| `write` | every route |
+
+`write` covers `read` rather than excluding it, because the `Location` header of a caller's
+own `201` points at a route that requires `read`. Too narrow a scope is answered with `403`
+and a `detail` saying which scope was held and which was needed — a caller learns only what
+its own credential is, which it already knew.
+
+**This is authentication and a scope, and it is still not ownership.** No account belongs to
+anyone, so any valid `write` credential can post against any account in the ledger. Closing
+that needs a tenant on `accounts`, on `transactions` and on `entries`, composite foreign
+keys so that a transaction spanning two tenants cannot be written at all, and the idempotency
+key scoped per tenant so one caller cannot reach another's transaction by guessing a key it
+already used. That is the next migration, and this paragraph is here so the gap is a stated
+limit rather than something a reader has to find.
 
 **Writes require an `Idempotency-Key` header**, quoted or bare — the IETF draft asks for a
 Structured Header, the industry sends it plain, and rejecting half the clients over
@@ -245,8 +273,9 @@ seeded in tests.
 docker compose up -d
 cp .env.example .env
 npm install
-npm run migrate      # schema, and the roles' privileges
+npm run migrate      # schema, the roles' privileges, currencies, the default tenant
 npm run provision    # lets the roles the connection strings name actually log in
+npm run issue-key -- my-client    # mints an API credential and prints it once
 npm run demo
 npm run reconcile
 npm run serve        # the HTTP surface, on PORT
@@ -254,6 +283,13 @@ npm run serve        # the HTTP surface, on PORT
 
 `provision` runs after `migrate` and not before: the groups its logins join have to exist
 first. Both are idempotent, so running either again does nothing.
+
+`issue-key` runs after `migrate` too, and needs no arguments beyond a name: the migration
+seeds a default tenant so there is nothing to invent between having a database and having a
+credential. It takes `--scope read` for a credential that may only read, and prints the
+token exactly once — only the digest is stored, so a lost token is replaced rather than
+recovered. `npm run revoke-key -- <key-id>` ends one; the id is printed at issue time and
+appears on every request line the server logs.
 
 `migrate` also seeds the currencies the ledger knows: USD, EUR and GBP with two minor units,
 JPY with none, KWD with three. `accounts.currency` is a foreign key into that table, so a
@@ -286,7 +322,7 @@ migrations/       versioned SQL; an applied migration is never edited
 src/domain/       entities and the pure double-entry rules. No I/O.
 src/application/  use cases and the ports they depend on
 src/adapters/     PostgreSQL, the HTTP surface, id generation
-src/entry/        composition roots: migrate, provision, demo, reconcile, serve
+src/entry/        composition roots: migrate, provision, issue-key, demo, reconcile, serve
 tests/unit/       pure rules
 tests/integration/what the database refuses, the concurrency proofs, the audit
 ```
@@ -295,9 +331,13 @@ Dependencies point inwards: `src/domain` does not know PostgreSQL exists.
 
 ## Not built yet
 
-Authorization, multi-currency transactions with FX, and balance snapshots for accounts too
-large to sum. Balance snapshots are deliberately absent: caching a balance before measuring
-that summing is too slow would be optimising a problem nobody has shown exists.
+Ownership. Credentials exist, carry a scope and can be revoked, but no account belongs to
+anyone: a `write` credential reaches every account in the ledger. The shape of the answer is
+in the HTTP section above, and it is a migration rather than a check bolted on top.
+
+Multi-currency transactions with FX, and balance snapshots for accounts too large to sum.
+Balance snapshots are deliberately absent: caching a balance before measuring that summing is
+too slow would be optimising a problem nobody has shown exists.
 
 Creating an account is not idempotent. The core has no key for it — `POST /v1/accounts`
 takes no `Idempotency-Key`, and a retried request opens a second account. Making it

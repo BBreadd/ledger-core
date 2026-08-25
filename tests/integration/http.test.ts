@@ -6,12 +6,29 @@ import type { Server } from "node:http";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createLedgerServer } from "../../src/adapters/http/server.ts";
+import { createCredentialDirectory } from "../../src/adapters/postgres/credential-directory.ts";
 import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
+import { mintToken } from "../../src/adapters/api-token.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
-import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
+import {
+  integrationAdminUrl,
+  integrationDatabaseUrl,
+  skipWithoutDatabase,
+} from "./database-url.ts";
 
-const TOKEN = "0123456789abcdef0123456789abcdef";
 const newId = createUuidV7();
+const DEFAULT_TENANT = "00000000-0000-0000-0000-000000000001";
+
+// Real credentials against the real table, because a fake directory here would test the
+// server against a story instead of against what it will actually be handed. They are
+// issued through the owner: the role the server connects with may read api_keys and may
+// not write it, which is the arrangement under test everywhere else in this file.
+const WRITER_ID = newId();
+const READER_ID = newId();
+const REVOKED_ID = newId();
+const writer = mintToken(WRITER_ID);
+const reader = mintToken(READER_ID);
+const revoked = mintToken(REVOKED_ID);
 
 type Response = {
   readonly status: number;
@@ -29,16 +46,35 @@ type Options = {
 describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
   const url = integrationDatabaseUrl ?? "";
   const store = createLedgerStore(url);
+  const credentials = createCredentialDirectory(url);
   const pool = new pg.Pool({ connectionString: url });
+  const admin = new pg.Pool({ connectionString: integrationAdminUrl ?? "" });
   let server: Server;
   let origin = "";
 
   before(async () => {
     await store.ensureCurrency("USD", 2);
 
+    await admin.query(
+      `insert into api_keys (id, tenant_id, name, secret_hash, scope)
+       values ($1, $4, 'http suite writer',  $5, 'write'),
+              ($2, $4, 'http suite reader',  $6, 'read'),
+              ($3, $4, 'http suite revoked', $7, 'write')`,
+      [
+        WRITER_ID,
+        READER_ID,
+        REVOKED_ID,
+        DEFAULT_TENANT,
+        Buffer.from(writer.secretHash),
+        Buffer.from(reader.secretHash),
+        Buffer.from(revoked.secretHash),
+      ],
+    );
+    await admin.query("update api_keys set revoked_at = now() where id = $1", [REVOKED_ID]);
+
     // Port 0 lets the kernel pick a free one. A hardcoded port makes a test suite fail on
     // whichever machine already has something listening there.
-    server = createLedgerServer({ store, newId, token: TOKEN, log: () => {} });
+    server = createLedgerServer({ store, credentials, newId, log: () => {} });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", resolve);
     });
@@ -56,13 +92,18 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
+    await admin.query("delete from api_keys where id = any($1)", [
+      [WRITER_ID, READER_ID, REVOKED_ID],
+    ]);
     await store.close();
+    await credentials.close();
     await pool.end();
+    await admin.end();
   });
 
   async function call(method: string, path: string, options: Options = {}): Promise<Response> {
     const headers: Record<string, string> = {};
-    const token = options.token === undefined ? TOKEN : options.token;
+    const token = options.token === undefined ? writer.token : options.token;
     if (token !== null) {
       headers["Authorization"] = `Bearer ${token}`;
     }
@@ -137,9 +178,9 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
       assert.equal(response.body["code"], "UNAUTHORIZED");
     });
 
-    it("refuses a write with the wrong token", async () => {
+    it("refuses a write with a real key id and the wrong secret", async () => {
       const response = await call("POST", "/v1/accounts", {
-        token: "f".repeat(TOKEN.length),
+        token: `lgr_${WRITER_ID}.${"f".repeat(43)}`,
         body: { name: "X", type: "asset", currency: "USD" },
       });
       assert.equal(response.status, 401);
@@ -148,6 +189,100 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
     it("answers a refusal as problem+json", async () => {
       const response = await call("GET", "/v1/transactions/nope", { token: null });
       assert.equal(response.headers.get("content-type"), "application/problem+json");
+    });
+
+    /**
+     * Revocation, end to end and with nothing restarted. The key was live when the server
+     * started and the process has been serving requests with a sibling of it ever since:
+     * nothing caches a credential, so the row going cold is the whole mechanism.
+     */
+    it("refuses a revoked key, without the server having been restarted", async () => {
+      const response = await call("POST", "/v1/accounts", {
+        token: revoked.token,
+        body: { name: "X", type: "asset", currency: "USD" },
+      });
+      assert.equal(response.status, 401);
+      assert.equal(response.body["code"], "UNAUTHORIZED");
+    });
+
+    it("refuses a token that is not shaped like one", async () => {
+      const response = await call("POST", "/v1/accounts", {
+        token: "0123456789abcdef0123456789abcdef",
+        body: { name: "X", type: "asset", currency: "USD" },
+      });
+      assert.equal(response.status, 401);
+    });
+  });
+
+  describe("what a scope may reach", () => {
+    /**
+     * 403 and not 404, and the difference is deliberate. Telling a caller its own scope is
+     * too narrow reveals nothing it did not already know about itself. Refusing to reach
+     * another tenant's data is a different refusal and does not get this answer -- that one
+     * has to be indistinguishable from data that is not there.
+     */
+    it("refuses a read-only credential on a write route, and says why", async () => {
+      const response = await call("POST", "/v1/accounts", {
+        token: reader.token,
+        body: { name: "Read only tried this", type: "asset", currency: "USD" },
+      });
+
+      assert.equal(response.status, 403);
+      assert.equal(response.body["code"], "FORBIDDEN");
+      assert.match(String(response.body["detail"]), /read scope/);
+    });
+
+    it("refuses a read-only credential on every write route there is", async () => {
+      const posted = await call("POST", "/v1/transactions", {
+        token: reader.token,
+        key: `scope-${newId()}`,
+        body: transfer(newId(), newId(), "100"),
+      });
+      assert.equal(posted.status, 403);
+
+      const reversed = await call("POST", `/v1/transactions/${newId()}/reversal`, {
+        token: reader.token,
+        key: `scope-${newId()}`,
+        body: { description: "nope" },
+      });
+      assert.equal(reversed.status, 403);
+    });
+
+    it("lets a read-only credential read", async () => {
+      const asset = await account("asset");
+      const response = await call("GET", `/v1/accounts/${asset}/balance`, {
+        token: reader.token,
+      });
+
+      assert.equal(response.status, 200);
+      assert.equal(response.body["accountId"], asset);
+    });
+
+    /**
+     * write covers read, and it has to: the Location header of a 201 from this very
+     * credential points at a route that requires read.
+     */
+    it("lets a write credential use the read routes its own 201 points at", async () => {
+      const asset = await account("asset");
+      const response = await call("GET", `/v1/accounts/${asset}/balance`, {
+        token: writer.token,
+      });
+
+      assert.equal(response.status, 200);
+    });
+
+    /**
+     * The scope is checked before the body is read, so a credential that may not use a
+     * route cannot make the server hold its payload. Measured with a body far over the
+     * limit: a 403 rather than the 413 an accepted credential would have got.
+     */
+    it("refuses on scope before it reads the body", async () => {
+      const response = await call("POST", "/v1/accounts", {
+        token: reader.token,
+        body: { name: "x".repeat(200_000), type: "asset", currency: "USD" },
+      });
+
+      assert.equal(response.status, 403);
     });
   });
 
@@ -448,7 +583,7 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
     it("answers 400 for a body that is not JSON at all", async () => {
       const response = await fetch(`${origin}/v1/accounts`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${writer.token}`, "Content-Type": "application/json" },
         body: "{not json",
       });
 
@@ -489,7 +624,7 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
      * body from being however much memory the caller feels like spending.
      */
     it("refuses an oversized chunked body, which declares no length at all", async () => {
-      const status = await chunkedPost(origin, "/v1/accounts", TOKEN, 70_000);
+      const status = await chunkedPost(origin, "/v1/accounts", writer.token, 70_000);
       assert.equal(status, 413);
     });
   });

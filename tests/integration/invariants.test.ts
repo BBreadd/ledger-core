@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import { integrationDatabaseUrl, skipWithoutDatabase } from "./database-url.ts";
 
 const newId = createUuidV7();
@@ -24,10 +25,10 @@ describe(
       usd = newId();
       eur = newId();
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, 'usd account', 'asset', 'USD', true),
-                ($2, 'eur account', 'asset', 'EUR', true)`,
-        [usd, eur],
+        `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+         values ($1, 'usd account', 'asset', 'USD', true, $3),
+                ($2, 'eur account', 'asset', 'EUR', true, $3)`,
+        [usd, eur, DEFAULT_TENANT_ID],
       );
     });
 
@@ -38,9 +39,9 @@ describe(
     it("rejects a transaction whose debits do not equal its credits", async () => {
       const other = newId();
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, 'counterparty', 'revenue', 'USD', true)`,
-        [other],
+        `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+         values ($1, 'counterparty', 'revenue', 'USD', true, $2)`,
+        [other, DEFAULT_TENANT_ID],
       );
 
       await assert.rejects(
@@ -96,9 +97,9 @@ describe(
     it("refuses a non-positive amount", async () => {
       const other = newId();
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, 'counterparty two', 'revenue', 'USD', true)`,
-        [other],
+        `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+         values ($1, 'counterparty two', 'revenue', 'USD', true, $2)`,
+        [other, DEFAULT_TENANT_ID],
       );
 
       await assert.rejects(
@@ -113,9 +114,9 @@ describe(
     it("refuses entries appended to a transaction that is already committed", async () => {
       const other = newId();
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, 'counterparty four', 'revenue', 'USD', true)`,
-        [other],
+        `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+         values ($1, 'counterparty four', 'revenue', 'USD', true, $2)`,
+        [other, DEFAULT_TENANT_ID],
       );
 
       const committed = await writeRaw(pool, [
@@ -144,9 +145,9 @@ describe(
     it("refuses to reuse an idempotency key", async () => {
       const other = newId();
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, 'counterparty three', 'revenue', 'USD', true)`,
-        [other],
+        `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+         values ($1, 'counterparty three', 'revenue', 'USD', true, $2)`,
+        [other, DEFAULT_TENANT_ID],
       );
 
       const key = `duplicate-${newId()}`;
@@ -182,14 +183,16 @@ async function writeRaw(
   try {
     await client.query("begin");
     await client.query(
-      `insert into transactions (id, idempotency_key, request_hash, description, occurred_at)
-       values ($1, $2, 'raw', 'bypasses the application', now())`,
-      [transactionId, idempotencyKey ?? `raw-${transactionId}`],
+      `insert into transactions
+         (id, idempotency_key, request_hash, description, occurred_at, tenant_id)
+       values ($1, $2, 'raw', 'bypasses the application', now(), $3)`,
+      [transactionId, idempotencyKey ?? `raw-${transactionId}`, DEFAULT_TENANT_ID],
     );
     for (const entry of entries) {
       await client.query(
-        `insert into entries (id, transaction_id, account_id, currency, direction, amount)
-         values ($1, $2, $3, $4, $5, $6::bigint)`,
+        `insert into entries
+           (id, transaction_id, account_id, currency, direction, amount, tenant_id)
+         values ($1, $2, $3, $4, $5, $6::bigint, $7)`,
         [
           newId(),
           transactionId,
@@ -197,6 +200,7 @@ async function writeRaw(
           entry.currency,
           entry.direction,
           entry.amount.toString(),
+          DEFAULT_TENANT_ID,
         ],
       );
     }
@@ -224,10 +228,11 @@ async function appendRaw(
   try {
     await client.query("begin");
     await client.query(
-      `insert into entries (id, transaction_id, account_id, currency, direction, amount)
+      `insert into entries
+         (id, transaction_id, account_id, currency, direction, amount, tenant_id)
        select *
          from unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::bpchar[],
-                     $5::entry_direction[], $6::bigint[])`,
+                     $5::entry_direction[], $6::bigint[], $7::uuid[])`,
       [
         entries.map(() => newId()),
         entries.map(() => transactionId),
@@ -235,6 +240,7 @@ async function appendRaw(
         entries.map((entry) => entry.currency),
         entries.map((entry) => entry.direction),
         entries.map((entry) => entry.amount.toString()),
+        entries.map(() => DEFAULT_TENANT_ID),
       ],
     );
     await client.query("commit");

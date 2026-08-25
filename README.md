@@ -25,6 +25,32 @@ works but that there are tests showing what breaks when the safeguards are remov
 | Amounts are strictly positive | `check (amount > 0)` |
 | An account marked non-negative never goes below zero, read in its own direction | Checked inside a row lock, and audited afterwards with the same rule |
 
+## Ownership
+
+An account belongs to exactly one tenant, and a transaction never leaves one. Neither of
+those is a rule the application applies — both are things the schema cannot record.
+
+`entries` carries `tenant_id`, denormalised from `accounts`, for the same single reason it
+already carries `currency`: it makes a composite foreign key possible. With
+`(account_id, tenant_id)` pointing at `accounts` and `(transaction_id, tenant_id)` pointing
+at `transactions`, an entry can only exist where its account and its transaction agree on
+whose it is. A transaction spanning two tenants is not refused. It cannot be written, by
+anyone, through any path.
+
+What that costs, said plainly rather than discovered later: an account can never change
+tenant, and value cannot move between two tenants in a single transaction. The first is
+right for a ledger — an account with history does not change hands, a new one is opened.
+The second is a real limit: a platform moving money between its customers does it through a
+clearing account on each side, which is two transactions and a design of its own. If that
+day comes, these foreign keys are what has to be taken apart, and that is the honest price
+of them being this strong.
+
+**Idempotency keys are unique per tenant, not globally**, and that is the other half of
+ownership rather than housekeeping. Under one global index a second tenant reusing a key
+receives the first tenant's answer — the retry path hands back whatever holds the key, and
+when the payload does not match it still reports that the key is taken. Callers name keys
+after their own orders, so this is the ordinary collision, not a remote one.
+
 ## The concurrency problem
 
 Two transfers withdrawing from the same account read the same balance, each concludes it
@@ -182,13 +208,20 @@ own `201` points at a route that requires `read`. Too narrow a scope is answered
 and a `detail` saying which scope was held and which was needed — a caller learns only what
 its own credential is, which it already knew.
 
-**This is authentication and a scope, and it is still not ownership.** No account belongs to
-anyone, so any valid `write` credential can post against any account in the ledger. Closing
-that needs a tenant on `accounts`, on `transactions` and on `entries`, composite foreign
-keys so that a transaction spanning two tenants cannot be written at all, and the idempotency
-key scoped per tenant so one caller cannot reach another's transaction by guessing a key it
-already used. That is the next migration, and this paragraph is here so the gap is a stated
-limit rather than something a reader has to find.
+**Every account belongs to a tenant, and the credential decides which.** The owner of a new
+account is taken from the token and never from the body — the parser refuses any field it
+was not told about, so a request naming `tenantId` is answered with `400` rather than
+quietly ignored.
+
+Reaching for another tenant's data is answered exactly as reaching for data that does not
+exist: `404` for an account or a transaction, `UNKNOWN_ACCOUNT` for one named inside a
+posting. That is not a decision taken in each handler — the tenant is part of the `where`
+clause, so nothing comes back and every caller lands in the branch it already had for a
+missing row. The distinction is not hidden, it is never made, which is what keeps it from
+leaking. The real reason is in the log next to the request id.
+
+This is deliberately not a `403`. A `403` would confirm that the id names something, and
+"that account exists but is not yours" is an answer about somebody else's ledger.
 
 **Writes require an `Idempotency-Key` header**, quoted or bare — the IETF draft asks for a
 Structured Header, the industry sends it plain, and rejecting half the clients over
@@ -319,7 +352,7 @@ files, then reconciles the ledger the suite left behind.
 
 ```
 migrations/       versioned SQL; an applied migration is never edited
-src/domain/       entities and the pure double-entry rules. No I/O.
+src/domain/       entities, ownership vocabulary, and the pure double-entry rules. No I/O.
 src/application/  use cases and the ports they depend on
 src/adapters/     PostgreSQL, the HTTP surface, id generation
 src/entry/        composition roots: migrate, provision, issue-key, demo, reconcile, serve
@@ -330,10 +363,6 @@ tests/integration/what the database refuses, the concurrency proofs, the audit
 Dependencies point inwards: `src/domain` does not know PostgreSQL exists.
 
 ## Not built yet
-
-Ownership. Credentials exist, carry a scope and can be revoked, but no account belongs to
-anyone: a `write` credential reaches every account in the ledger. The shape of the answer is
-in the HTTP section above, and it is a migration rather than a check bolted on top.
 
 Multi-currency transactions with FX, and balance snapshots for accounts too large to sum.
 Balance snapshots are deliberately absent: caching a balance before measuring that summing is

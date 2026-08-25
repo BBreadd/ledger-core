@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import {
   integrationAdminUrl,
   integrationAuditorUrl,
@@ -30,10 +31,10 @@ describe("what each role is allowed to do", { skip: skipWithoutDatabase }, () =>
     accountId = newId();
     const counterparty = newId();
     await app.query(
-      `insert into accounts (id, name, type, currency, allows_negative)
-       values ($1, 'permission fixture', 'asset', 'USD', true),
-              ($2, 'permission counterparty', 'revenue', 'USD', true)`,
-      [accountId, counterparty],
+      `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+       values ($1, 'permission fixture', 'asset', 'USD', true, $3),
+              ($2, 'permission counterparty', 'revenue', 'USD', true, $3)`,
+      [accountId, counterparty, DEFAULT_TENANT_ID],
     );
 
     transactionId = newId();
@@ -41,14 +42,16 @@ describe("what each role is allowed to do", { skip: skipWithoutDatabase }, () =>
     try {
       await client.query("begin");
       await client.query(
-        `insert into transactions (id, idempotency_key, request_hash, description, occurred_at)
-         values ($1, $2, 'permissions', 'a posting to try to tamper with', now())`,
-        [transactionId, `permissions-${transactionId}`],
+        `insert into transactions
+           (id, idempotency_key, request_hash, description, occurred_at, tenant_id)
+         values ($1, $2, 'permissions', 'a posting to try to tamper with', now(), $3)`,
+        [transactionId, `permissions-${transactionId}`, DEFAULT_TENANT_ID],
       );
       await client.query(
-        `insert into entries (id, transaction_id, account_id, currency, direction, amount)
-         values ($1, $3, $4, 'USD', 'debit', 100), ($2, $3, $5, 'USD', 'credit', 100)`,
-        [newId(), newId(), transactionId, accountId, counterparty],
+        `insert into entries
+           (id, transaction_id, account_id, currency, direction, amount, tenant_id)
+         values ($1, $3, $4, 'USD', 'debit', 100, $6), ($2, $3, $5, 'USD', 'credit', 100, $6)`,
+        [newId(), newId(), transactionId, accountId, counterparty, DEFAULT_TENANT_ID],
       );
       await client.query("commit");
     } catch (error) {

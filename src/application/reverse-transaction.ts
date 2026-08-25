@@ -22,8 +22,14 @@ export type ReverseOutcome =
   | { readonly status: "replayed"; readonly transaction: StoredTransaction }
   | { readonly status: "rejected"; readonly rejections: readonly ReversalRejection[] };
 
+/**
+ * tenantId is here rather than alongside because a reversal request is already an object,
+ * and it does not reach the fingerprint: reversalFingerprint names the three fields it
+ * hashes, and the tenant is the scope of the key rather than part of what was asked for.
+ */
 export type ReversalRequest = {
   readonly transactionId: string;
+  readonly tenantId: string;
   readonly idempotencyKey: string;
   readonly description: string;
 };
@@ -55,7 +61,15 @@ export async function reverseTransaction(
 
   try {
     const outcome = await deps.store.inTransaction(async (uow) => {
-      const original = await uow.findTransaction(request.transactionId);
+      // Scoped to the caller's tenant, so a transaction belonging to somebody else is
+      // simply not found. Ownership needs no branch of its own here: the branch for a
+      // transaction that does not exist already says the only thing that may be said.
+      //
+      // No lock is taken, and this does not reintroduce one. The read exists to build the
+      // mirror, not to decide against a balance, and an account cannot change tenant --
+      // the composite foreign keys make that unwritable -- so there is nothing here that
+      // could be true when read and false when written.
+      const original = await uow.findTransaction(request.transactionId, request.tenantId);
 
       if (original === null) {
         return rejected("UNKNOWN_TRANSACTION", `no transaction with id ${request.transactionId}`);
@@ -78,6 +92,7 @@ export async function reverseTransaction(
 
       const transaction = await uow.insertTransaction({
         id: deps.newId(),
+        tenantId: request.tenantId,
         idempotencyKey: request.idempotencyKey,
         requestHash: reversalFingerprint(request),
         description: request.description,
@@ -95,14 +110,26 @@ export async function reverseTransaction(
 
     return outcome;
   } catch (error) {
-    if (error instanceof AlreadyReversedError) {
+    // An honest retry of a reversal violates both unique indexes at once: the same key was
+    // used before, and the transaction it names was reversed before. Which of the two
+    // reports the 23505 is not decided by anything in this file -- PostgreSQL checks the
+    // indexes in the order they were created, so recreating one moves it in the queue.
+    // Measured: scoping idempotency per tenant rebuilt that index last, and a retry that
+    // used to replay started coming back ALREADY_REVERSED.
+    //
+    // So the key is asked about first, whichever constraint spoke. A caller retrying the
+    // same request gets its original answer; a caller reaching for an already-reversed
+    // transaction under a new key gets the conflict. The outcome no longer depends on an
+    // ordering nobody declared.
+    if (error instanceof AlreadyReversedError || error instanceof DuplicateIdempotencyKeyError) {
+      const outcome = await replayOrReject(deps, request);
+      if (outcome.status !== "rejected" || !(error instanceof AlreadyReversedError)) {
+        return outcome;
+      }
       return rejected(
         "ALREADY_REVERSED",
         `transaction ${request.transactionId} already has a reversal`,
       );
-    }
-    if (error instanceof DuplicateIdempotencyKeyError) {
-      return replayOrReject(deps, request);
     }
     throw error;
   }
@@ -112,9 +139,16 @@ async function replayOrReject(
   deps: ReverseDependencies,
   request: ReversalRequest,
 ): Promise<ReverseOutcome> {
-  const existing = await deps.store.findByIdempotencyKey(request.idempotencyKey);
+  const existing = await deps.store.findByIdempotencyKey(request.tenantId, request.idempotencyKey);
   if (existing === null) {
-    throw new Error(`idempotency key ${request.idempotencyKey} was taken but nothing holds it`);
+    // Reachable now, and only from the branch above: the reversal index can report the
+    // conflict while this key has never been used at all. That is not a replay and not a
+    // bug -- it is a second reversal wearing a new key, and the caller above turns it into
+    // ALREADY_REVERSED. When the duplicate key really was the cause, the row is there.
+    return rejected(
+      "ALREADY_REVERSED",
+      `transaction ${request.transactionId} already has a reversal`,
+    );
   }
 
   // A retry means the same key asking for the same thing. The same key pointing anywhere

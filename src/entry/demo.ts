@@ -13,6 +13,7 @@ import { normalBalance } from "../domain/account.ts";
 import { format } from "../domain/money.ts";
 import type { Currency } from "../domain/money.ts";
 import type { TransactionDraft } from "../domain/transaction.ts";
+import { DEFAULT_TENANT_ID } from "../domain/tenant.ts";
 
 const USD: Currency = { code: "USD", minorUnit: 2 };
 
@@ -32,16 +33,20 @@ async function main(): Promise<void> {
     const savings = newId();
     const revenue = newId();
 
+    // The tenant a migrated database ships with. Over HTTP this comes from the caller's
+    // credential; there is no caller here, so the demo names it.
+    const tenantId = DEFAULT_TENANT_ID;
+
     await store.createAccount({
-      id: checking, name: `Checking ${run}`, type: "asset",
+      id: checking, tenantId, name: `Checking ${run}`, type: "asset",
       currency: "USD", allowsNegative: false,
     });
     await store.createAccount({
-      id: savings, name: `Savings ${run}`, type: "asset",
+      id: savings, tenantId, name: `Savings ${run}`, type: "asset",
       currency: "USD", allowsNegative: false,
     });
     await store.createAccount({
-      id: revenue, name: `Revenue ${run}`, type: "revenue",
+      id: revenue, tenantId, name: `Revenue ${run}`, type: "revenue",
       currency: "USD", allowsNegative: false,
     });
 
@@ -57,7 +62,7 @@ async function main(): Promise<void> {
           { accountId: checking, direction: "debit", amount: 50_000n },
           { accountId: revenue, direction: "credit", amount: 50_000n },
         ],
-      }),
+      }, tenantId),
     );
 
     step("2. Transfer 120.00 from checking to savings");
@@ -71,14 +76,14 @@ async function main(): Promise<void> {
         { accountId: checking, direction: "credit", amount: 12_000n },
       ],
     };
-    const transferOutcome = await postTransaction(deps, transfer);
+    const transferOutcome = await postTransaction(deps, transfer, tenantId);
     if (transferOutcome.status === "posted") {
       transferId = transferOutcome.transaction.id;
     }
     await show(Promise.resolve(transferOutcome));
 
     step("3. The exact same request again, as a retry would send it");
-    await show(postTransaction(deps, transfer));
+    await show(postTransaction(deps, transfer, tenantId));
 
     step("4. Same idempotency key, different amount");
     await show(
@@ -88,7 +93,7 @@ async function main(): Promise<void> {
           { accountId: savings, direction: "debit", amount: 12_100n },
           { accountId: checking, direction: "credit", amount: 12_100n },
         ],
-      }),
+      }, tenantId),
     );
 
     step("5. Debits that do not equal credits");
@@ -101,7 +106,7 @@ async function main(): Promise<void> {
           { accountId: savings, direction: "debit", amount: 10_000n },
           { accountId: checking, direction: "credit", amount: 9_000n },
         ],
-      }),
+      }, tenantId),
     );
 
     step("6. Withdraw more than checking holds");
@@ -114,13 +119,13 @@ async function main(): Promise<void> {
           { accountId: savings, direction: "debit", amount: 1_000_000n },
           { accountId: checking, direction: "credit", amount: 1_000_000n },
         ],
-      }),
+      }, tenantId),
     );
 
     step("7. Undo the transfer -- the only correction there is, since editing is impossible");
     await showReversal(
       reverseTransaction(deps, {
-        transactionId: transferId,
+        transactionId: transferId, tenantId,
         idempotencyKey: `${run}-undo-transfer`,
         description: "Transfer was made in error",
       }),
@@ -129,16 +134,16 @@ async function main(): Promise<void> {
     step("8. Undo it a second time");
     await showReversal(
       reverseTransaction(deps, {
-        transactionId: transferId,
+        transactionId: transferId, tenantId,
         idempotencyKey: `${run}-undo-again`,
         description: "Should be refused",
       }),
     );
 
     console.log("\nbalances");
-    await printBalance(store, "checking", checking);
-    await printBalance(store, "savings ", savings);
-    await printBalance(store, "revenue ", revenue);
+    await printBalance(store, tenantId, "checking", checking);
+    await printBalance(store, tenantId, "savings ", savings);
+    await printBalance(store, tenantId, "revenue ", revenue);
   } finally {
     await store.close();
   }
@@ -173,8 +178,10 @@ async function showReversal(outcome: Promise<ReverseOutcome>): Promise<void> {
   );
 }
 
-async function printBalance(store: LedgerStore, label: string, accountId: string): Promise<void> {
-  const account = await store.findAccountBalance(accountId);
+async function printBalance(
+  store: LedgerStore, tenantId: string, label: string, accountId: string,
+): Promise<void> {
+  const account = await store.findAccountBalance(accountId, tenantId);
   if (account === null) {
     console.log(`   ${label}  no such account`);
     return;

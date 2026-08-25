@@ -15,9 +15,7 @@ import { requireDatabaseUrl } from "../config.ts";
 import { mintToken } from "../adapters/api-token.ts";
 import { createUuidV7 } from "../adapters/uuid-v7.ts";
 import type { Scope } from "../application/ports.ts";
-
-/** The tenant migration 0007 seeds, so that issuing a first key needs no other argument. */
-const DEFAULT_TENANT = "00000000-0000-0000-0000-000000000001";
+import { DEFAULT_TENANT_ID } from "../domain/tenant.ts";
 
 type Arguments = {
   readonly name: string;
@@ -63,7 +61,7 @@ async function main(): Promise<void> {
 function parseArguments(argv: readonly string[]): Arguments {
   let name: string | undefined;
   let scope: Scope = "write";
-  let tenantId = DEFAULT_TENANT;
+  let tenantId = DEFAULT_TENANT_ID;
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];

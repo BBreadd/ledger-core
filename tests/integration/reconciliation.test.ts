@@ -10,6 +10,7 @@ import {
 } from "../../src/adapters/postgres/reconciliation-source.ts";
 import { reconcile } from "../../src/application/reconcile.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import type { AccountType } from "../../src/domain/account.ts";
 import type { CheckId, ReconciliationReport } from "../../src/domain/reconciliation.ts";
 import {
@@ -359,9 +360,9 @@ async function createAccount(
   // Set at creation rather than updated afterwards: UPDATE on accounts is a privilege the
   // application role does not have, and these fixtures run as the application.
   await client.query(
-    `insert into accounts (id, name, type, currency, allows_negative)
-     values ($1, $2, $3, $4, $5)`,
-    [id, `audit fixture ${id}`, type, currency, allowsNegative],
+    `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+     values ($1, $2, $3, $4, $5, $6)`,
+    [id, `audit fixture ${id}`, type, currency, allowsNegative, DEFAULT_TENANT_ID],
   );
   return id;
 }
@@ -373,9 +374,10 @@ async function insertHeader(
 ): Promise<void> {
   await client.query(
     `insert into transactions
-       (id, idempotency_key, request_hash, description, occurred_at, reverses_transaction_id)
-     values ($1, $2, 'audit', 'never committed', now(), $3)`,
-    [transactionId, `audit-${transactionId}`, reverses],
+       (id, idempotency_key, request_hash, description, occurred_at,
+        reverses_transaction_id, tenant_id)
+     values ($1, $2, 'audit', 'never committed', now(), $3, $4)`,
+    [transactionId, `audit-${transactionId}`, reverses, DEFAULT_TENANT_ID],
   );
 }
 
@@ -388,9 +390,10 @@ async function insertEntry(
   amount: bigint,
 ): Promise<void> {
   await client.query(
-    `insert into entries (id, transaction_id, account_id, currency, direction, amount)
-     values ($1, $2, $3, $4, $5, $6::bigint)`,
-    [newId(), transactionId, accountId, currency, direction, amount.toString()],
+    `insert into entries
+       (id, transaction_id, account_id, currency, direction, amount, tenant_id)
+     values ($1, $2, $3, $4, $5, $6::bigint, $7)`,
+    [newId(), transactionId, accountId, currency, direction, amount.toString(), DEFAULT_TENANT_ID],
   );
 }
 

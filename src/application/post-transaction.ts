@@ -41,9 +41,21 @@ export type PostDependencies = {
   readonly newId: IdGenerator;
 };
 
+/**
+ * The tenant is a third argument rather than a field on the draft, and deliberately. A
+ * draft is what the caller asked for; the tenant is who asked, and it comes from the
+ * credential. Folding it into the draft would put it within reach of the body parser, and
+ * an account opened or posted to on somebody else's behalf is the one thing this must not
+ * be able to express.
+ *
+ * It is also kept out of the request fingerprint. The unique index is now scoped per
+ * tenant, so the tenant is the scope of the key rather than part of what the key promises;
+ * hashing it as well would say the same thing twice.
+ */
 export async function postTransaction(
   deps: PostDependencies,
   draft: TransactionDraft,
+  tenantId: string,
 ): Promise<PostOutcome> {
   const violations = validate(draft);
   if (violations.length > 0) {
@@ -60,7 +72,13 @@ export async function postTransaction(
       // balance, each decides it has room, and together they overdraw the account.
       // Raising the isolation level to REPEATABLE READ would not help -- that is
       // snapshot isolation, and snapshot isolation does not prevent write skew.
-      const locked = await uow.lockAccounts(accountIds);
+      // Scoped to the caller's tenant. An account belonging to anybody else does not come
+      // back, so it lands in the `missing` branch below and is answered with
+      // UNKNOWN_ACCOUNT -- the same answer an id that was never created gets. That is the
+      // whole ownership check on this path, and it needed no new branch and no new
+      // rejection code: telling "not yours" apart from "not there" would confirm to a
+      // stranger that an account exists.
+      const locked = await uow.lockAccounts(accountIds, tenantId);
       const byId = new Map(locked.map((account) => [account.id, account]));
 
       const missing = accountIds.filter((id) => !byId.has(id));
@@ -96,6 +114,7 @@ export async function postTransaction(
 
       const transaction = await uow.insertTransaction({
         id: deps.newId(),
+        tenantId,
         idempotencyKey: draft.idempotencyKey,
         requestHash,
         description: draft.description,
@@ -113,16 +132,17 @@ export async function postTransaction(
     // The unique index is the idempotency check. Looking the key up before inserting
     // would be the same read-then-write race the lock above exists to prevent, so a
     // duplicate is detected by losing the insert, not by asking first.
-    return replayOrReject(deps.store, draft.idempotencyKey, requestHash);
+    return replayOrReject(deps.store, tenantId, draft.idempotencyKey, requestHash);
   }
 }
 
 async function replayOrReject(
   store: LedgerStore,
+  tenantId: string,
   key: string,
   requestHash: string,
 ): Promise<PostOutcome> {
-  const original = await store.findByIdempotencyKey(key);
+  const original = await store.findByIdempotencyKey(tenantId, key);
   if (original === null) {
     throw new Error(`idempotency key ${key} was taken but no transaction holds it`);
   }

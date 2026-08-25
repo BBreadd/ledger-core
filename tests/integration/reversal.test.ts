@@ -5,6 +5,7 @@ import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import { reverseTransaction } from "../../src/application/reverse-transaction.ts";
 import type { StoredTransaction } from "../../src/application/ports.ts";
@@ -38,9 +39,9 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
   async function account(allowsNegative: boolean, type = "asset"): Promise<string> {
     const id = newId();
     await pool.query(
-      `insert into accounts (id, name, type, currency, allows_negative)
-       values ($1, $2, $3, 'USD', $4)`,
-      [id, `reversal fixture ${id}`, type, allowsNegative],
+      `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+       values ($1, $2, $3, 'USD', $4, $5)`,
+      [id, `reversal fixture ${id}`, type, allowsNegative, DEFAULT_TENANT_ID],
     );
     return id;
   }
@@ -54,7 +55,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
         { accountId: to, direction: "debit", amount },
         { accountId: from, direction: "credit", amount },
       ],
-    });
+    }, DEFAULT_TENANT_ID);
     assert.equal(outcome.status, "posted");
     return outcome.transaction;
   }
@@ -64,9 +65,10 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     const destination = await account(false);
     const original = await post(source, destination, 4_200n);
 
-    assert.equal((await store.findAccountBalance(destination))?.balance, 4_200n);
+    assert.equal((await store.findAccountBalance(destination, DEFAULT_TENANT_ID))?.balance, 4_200n);
 
     const outcome = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: original.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Posted in error",
@@ -79,11 +81,11 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
 
     assert.equal(outcome.transaction.reversesTransactionId, original.id);
     assert.equal(
-      (await store.findAccountBalance(destination))?.balance,
+      (await store.findAccountBalance(destination, DEFAULT_TENANT_ID))?.balance,
       0n,
       "the pair cancels on every account",
     );
-    assert.equal((await store.findAccountBalance(source))?.balance, 0n);
+    assert.equal((await store.findAccountBalance(source, DEFAULT_TENANT_ID))?.balance, 0n);
 
     const directions = outcome.transaction.entries.map((entry) => ({
       accountId: entry.accountId,
@@ -107,6 +109,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     const original = await post(source, destination, 100n);
 
     const outcome = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: original.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Posted in error",
@@ -129,6 +132,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     const original = await post(source, destination, 500n);
 
     const first = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: original.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Posted in error",
@@ -138,6 +142,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     // A different key, so this is not idempotency doing the work: it is the unique index
     // on reverses_transaction_id, and the second insert losing it.
     const second = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: original.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Undoing it again",
@@ -156,6 +161,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     const original = await post(source, destination, 800n);
 
     const first = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: original.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Posted in error",
@@ -166,6 +172,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
     }
 
     const second = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: first.transaction.id,
       idempotencyKey: `undo-${newId()}`,
       description: "Undo the undo",
@@ -186,6 +193,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
 
     const request = {
       transactionId: first.id,
+      tenantId: DEFAULT_TENANT_ID,
       idempotencyKey: `undo-${newId()}`,
       description: "Posted in error",
     };
@@ -209,6 +217,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
 
   it("says so when there is nothing to reverse", async () => {
     const outcome = await reverseTransaction(deps, {
+      tenantId: DEFAULT_TENANT_ID,
       transactionId: newId(),
       idempotencyKey: `undo-${newId()}`,
       description: "Undo something that never happened",
@@ -237,7 +246,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
 
     const funding = await post(revenue, checking, 10_000n);
     await post(checking, elsewhere, 10_000n);
-    assert.equal((await store.findAccountBalance(checking))?.balance, 0n, "the money has been spent");
+    assert.equal((await store.findAccountBalance(checking, DEFAULT_TENANT_ID))?.balance, 0n, "the money has been spent");
 
     // A plain withdrawal at this point is refused, which is what makes the next line
     // meaningful rather than a demonstration that nothing was being enforced.
@@ -249,18 +258,19 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
         { accountId: elsewhere, direction: "debit", amount: 10_000n },
         { accountId: checking, direction: "credit", amount: 10_000n },
       ],
-    });
+    }, DEFAULT_TENANT_ID);
     assert.equal(withdrawal.status, "rejected");
 
     try {
       const outcome = await reverseTransaction(deps, {
+        tenantId: DEFAULT_TENANT_ID,
         transactionId: funding.id,
         idempotencyKey: `undo-${newId()}`,
         description: "The deposit never should have happened",
       });
 
       assert.equal(outcome.status, "reversed", "a correction is not subject to the floor");
-      assert.equal((await store.findAccountBalance(checking))?.balance, -10_000n);
+      assert.equal((await store.findAccountBalance(checking, DEFAULT_TENANT_ID))?.balance, -10_000n);
     } finally {
       // The shortfall is genuine, so the audit would report it forever. Cleared here for
       // the same reason the write-skew demonstration clears its overdraft: a test must not
@@ -299,7 +309,7 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
         { accountId: third, direction: "debit", amount: 400n },
         { accountId: source, direction: "credit", amount: 1_000n },
       ],
-    });
+    }, DEFAULT_TENANT_ID);
     assert.equal(outcome.status, "posted");
     if (outcome.status !== "posted") {
       return;
@@ -320,9 +330,9 @@ describe("reversing a posting", { skip: skipWithoutDatabase }, () => {
       pool.query(
         `insert into transactions
            (id, idempotency_key, request_hash, description, occurred_at,
-            reverses_transaction_id)
-         values ($1, $2, 'raw', 'reverses itself', now(), $1)`,
-        [id, `self-${id}`],
+            reverses_transaction_id, tenant_id)
+         values ($1, $2, 'raw', 'reverses itself', now(), $1, $3)`,
+        [id, `self-${id}`, DEFAULT_TENANT_ID],
       ),
       /transactions_no_self_reversal|violates check/i,
     );
@@ -347,15 +357,17 @@ async function writeRawReversal(
     await client.query("begin");
     await client.query(
       `insert into transactions
-         (id, idempotency_key, request_hash, description, occurred_at, reverses_transaction_id)
-       values ($1, $2, 'raw', 'bypasses the application', now(), $3)`,
-      [id, `raw-${id}`, reverses],
+         (id, idempotency_key, request_hash, description, occurred_at,
+          reverses_transaction_id, tenant_id)
+       values ($1, $2, 'raw', 'bypasses the application', now(), $3, $4)`,
+      [id, `raw-${id}`, reverses, DEFAULT_TENANT_ID],
     );
     for (const leg of legs) {
       await client.query(
-        `insert into entries (id, transaction_id, account_id, currency, direction, amount)
-         values ($1, $2, $3, 'USD', $4, $5::bigint)`,
-        [newId(), id, leg.accountId, leg.direction, leg.amount.toString()],
+        `insert into entries
+           (id, transaction_id, account_id, currency, direction, amount, tenant_id)
+         values ($1, $2, $3, 'USD', $4, $5::bigint, $6)`,
+        [newId(), id, leg.accountId, leg.direction, leg.amount.toString(), DEFAULT_TENANT_ID],
       );
     }
     await client.query("commit");

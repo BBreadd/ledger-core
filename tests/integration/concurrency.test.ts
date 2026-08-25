@@ -5,6 +5,7 @@ import { after, describe, it } from "node:test";
 import pg from "pg";
 import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import type { PostOutcome } from "../../src/application/post-transaction.ts";
 import {
@@ -76,7 +77,7 @@ describe(
       // that every future audit reports and nobody caused. A test that commits a
       // deliberate violation and walks away turns the auditor into a liar.
       try {
-        const balance = (await store.findAccountBalance(checking))?.balance;
+        const balance = (await store.findAccountBalance(checking, DEFAULT_TENANT_ID))?.balance;
         assert.equal(balance, -2_000n, "both withdrawals landed and the account went negative");
       } finally {
         await erase(admin, [checking, revenue]);
@@ -102,6 +103,7 @@ describe(
               { accountId: checking, direction: "credit", amount: 6_000n },
             ],
           },
+          DEFAULT_TENANT_ID,
         );
 
       const outcomes = await Promise.all([
@@ -117,7 +119,7 @@ describe(
       assert.equal(rejected[0]?.status === "rejected" && rejected[0].rejections[0]?.code,
         "INSUFFICIENT_FUNDS");
 
-      const balance = (await store.findAccountBalance(checking))?.balance;
+      const balance = (await store.findAccountBalance(checking, DEFAULT_TENANT_ID))?.balance;
       assert.equal(balance, 4_000n, "the account never goes below zero");
     });
 
@@ -141,6 +143,7 @@ describe(
               { accountId: from, direction: "credit", amount: 100n },
             ],
           },
+          DEFAULT_TENANT_ID,
         );
 
       const outcomes = await Promise.all(
@@ -169,9 +172,9 @@ async function seedAccounts(
     "insert into currencies (code, minor_unit) values ('USD', 2) on conflict do nothing",
   );
   await pool.query(
-    `insert into accounts (id, name, type, currency, allows_negative)
-     values ($1, $2, 'asset', 'USD', false), ($3, $4, 'revenue', 'USD', true)`,
-    [checking, `checking ${checking}`, revenue, `revenue ${revenue}`],
+    `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+     values ($1, $2, 'asset', 'USD', false, $5), ($3, $4, 'revenue', 'USD', true, $5)`,
+    [checking, `checking ${checking}`, revenue, `revenue ${revenue}`, DEFAULT_TENANT_ID],
   );
 
   // The header and its entries have to land in one database transaction. Two separate
@@ -245,13 +248,16 @@ async function insertRawTransfer(
 ): Promise<void> {
   const transactionId = newId();
   await client.query(
-    `insert into transactions (id, idempotency_key, request_hash, description, occurred_at)
-     values ($1, $2, 'raw', 'Unlocked withdrawal', now())`,
-    [transactionId, `raw-${transactionId}`],
+    `insert into transactions
+       (id, idempotency_key, request_hash, description, occurred_at, tenant_id)
+     values ($1, $2, 'raw', 'Unlocked withdrawal', now(), $3)`,
+    [transactionId, `raw-${transactionId}`, DEFAULT_TENANT_ID],
   );
   await client.query(
-    `insert into entries (id, transaction_id, account_id, currency, direction, amount)
-     values ($1, $3, $4, 'USD', 'debit', $6::bigint), ($2, $3, $5, 'USD', 'credit', $6::bigint)`,
-    [newId(), newId(), transactionId, to, from, amount.toString()],
+    `insert into entries
+       (id, transaction_id, account_id, currency, direction, amount, tenant_id)
+     values ($1, $3, $4, 'USD', 'debit', $6::bigint, $7),
+            ($2, $3, $5, 'USD', 'credit', $6::bigint, $7)`,
+    [newId(), newId(), transactionId, to, from, amount.toString(), DEFAULT_TENANT_ID],
   );
 }

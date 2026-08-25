@@ -72,6 +72,8 @@ type RequestContext = {
   readonly request: IncomingMessage;
   readonly body: unknown;
   readonly requestId: string;
+  /** Null only on /health, the one route that identifies nobody. */
+  readonly principal: Principal | null;
 };
 
 type Handler = {
@@ -193,7 +195,7 @@ export function createLedgerServer(deps: ServerDependencies): Server {
       }
     }
 
-    const context = { params: match.params, request, requestId };
+    const context = { params: match.params, request, requestId, principal };
 
     if (!handler.reads) {
       return { principal, reply: await handler.handle({ ...context, body: undefined }) };
@@ -273,8 +275,12 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
           );
         }
 
+        // The tenant comes from the credential and can come from nowhere else. The body
+        // parser rejects any field it was not told about, so a caller that tries to send
+        // tenantId is answered with 400 rather than quietly ignored -- a client that
+        // believes it chose an owner and did not is worse than one that is told no.
         const id = deps.newId();
-        await deps.store.createAccount({ id, ...parsed.value });
+        await deps.store.createAccount({ id, tenantId: tenantOf(context), ...parsed.value });
 
         // No Location header, and its absence is deliberate: there is no GET for an
         // account, and a Location pointing at a 404 would be a lie the compiler cannot
@@ -297,7 +303,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
           return problemReply(draft.code, draft.message);
         }
 
-        const outcome = await postTransaction(core, draft.value);
+        const outcome = await postTransaction(core, draft.value, tenantOf(context));
         if (outcome.status === "rejected") {
           return fromProblem(problemFromRejections(outcome.rejections));
         }
@@ -332,6 +338,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
 
         const outcome = await reverseTransaction(core, {
           transactionId: id.value,
+          tenantId: tenantOf(context),
           idempotencyKey: key.value,
           description: description.value,
         });
@@ -356,7 +363,10 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
           return problemReply(id.code, id.message);
         }
 
-        const transaction = await deps.store.findTransaction(id.value);
+        // One branch, and it covers both "there is no such transaction" and "it is not
+        // yours", because the query returns nothing in either case. The distinction is not
+        // lost -- it was never made, which is what keeps it from leaking.
+        const transaction = await deps.store.findTransaction(id.value, tenantOf(context));
         if (transaction === null) {
           return problemReply("UNKNOWN_TRANSACTION", `no transaction with id ${id.value}`);
         }
@@ -374,7 +384,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
           return problemReply(id.code, id.message);
         }
 
-        const account = await deps.store.findAccountBalance(id.value);
+        const account = await deps.store.findAccountBalance(id.value, tenantOf(context));
         if (account === null) {
           return problemReply("NOT_FOUND", `no account with id ${id.value}`);
         }
@@ -388,6 +398,19 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
 
 function pathUuid(params: RouteParams, name: string): ParseResult<string> {
   return parseUuidPath(params[name] ?? "");
+}
+
+/**
+ * Unreachable on every route that calls it: dispatch refuses anything but /health before a
+ * handler runs, and /health does not ask. If it ever fires, a route was declared
+ * `requires: "none"` and then went looking for a caller, which is a bug and gets the answer
+ * a bug gets.
+ */
+function tenantOf(context: RequestContext): string {
+  if (context.principal === null) {
+    throw new Error("a handler asked who the caller was on a route that requires no credential");
+  }
+  return context.principal.tenantId;
 }
 
 async function viewOf(

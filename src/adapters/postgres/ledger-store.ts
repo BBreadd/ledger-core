@@ -52,7 +52,11 @@ function toSmallInt(value: unknown, column: string): number {
 }
 
 const UNIQUE_VIOLATION = "23505";
-const IDEMPOTENCY_KEY_CONSTRAINT = "transactions_idempotency_key_key";
+// Named in migration 0008 rather than generated, and read back here. Scoping idempotency
+// per tenant meant replacing the unique index, and a replacement PostgreSQL named for
+// itself would have stopped matching this string silently: the duplicate would no longer
+// translate into a replay, and an honest retry would come back a 500.
+const IDEMPOTENCY_KEY_CONSTRAINT = "transactions_idempotency_key_per_tenant";
 const REVERSES_ONCE_CONSTRAINT = "transactions_reverses_once";
 
 const TRANSACTION_COLUMNS = `id, seq, idempotency_key, request_hash, description,
@@ -87,13 +91,20 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
 
     async createAccount(account: NewAccount): Promise<void> {
       await pool.query(
-        `insert into accounts (id, name, type, currency, allows_negative)
-         values ($1, $2, $3, $4, $5)`,
-        [account.id, account.name, account.type, account.currency, account.allowsNegative],
+        `insert into accounts (id, tenant_id, name, type, currency, allows_negative)
+         values ($1, $2, $3, $4, $5, $6)`,
+        [
+          account.id,
+          account.tenantId,
+          account.name,
+          account.type,
+          account.currency,
+          account.allowsNegative,
+        ],
       );
     },
 
-    async findAccountBalance(accountId: string): Promise<AccountBalance | null> {
+    async findAccountBalance(accountId: string, tenantId: string): Promise<AccountBalance | null> {
       // Driven from accounts with a LEFT JOIN rather than aggregating entries, so that an
       // account with no entries yet comes back as zero while an id that was never created
       // comes back as nothing. Aggregating entries alone answers both with zero.
@@ -105,8 +116,9 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
            from accounts a
            left join entries e on e.account_id = a.id
           where a.id = $1
+            and a.tenant_id = $2
           group by a.id, a.type, a.currency`,
-        [accountId],
+        [accountId, tenantId],
       );
 
       const row = result.rows[0];
@@ -122,12 +134,12 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
       };
     },
 
-    findByIdempotencyKey(key: string): Promise<StoredTransaction | null> {
-      return loadTransaction(pool, "idempotency_key", key);
+    findByIdempotencyKey(tenantId: string, key: string): Promise<StoredTransaction | null> {
+      return loadTransaction(pool, "idempotency_key", key, tenantId);
     },
 
-    findTransaction(id: string): Promise<StoredTransaction | null> {
-      return loadTransaction(pool, "id", id);
+    findTransaction(id: string, tenantId: string): Promise<StoredTransaction | null> {
+      return loadTransaction(pool, "id", id, tenantId);
     },
 
     async findCurrency(code: string): Promise<Currency | null> {
@@ -156,15 +168,25 @@ export function createLedgerStore(databaseUrl: string): LedgerStore {
 
 function unitOfWork(client: PoolClient): UnitOfWork {
   return {
-    async lockAccounts(accountIds: readonly string[]): Promise<readonly LockedAccount[]> {
+    async lockAccounts(
+      accountIds: readonly string[],
+      tenantId: string,
+    ): Promise<readonly LockedAccount[]> {
       // Locked one at a time, in sorted id order, on purpose. A single
       // `where id = any($1) order by id for update` reads as if it locked in order, but
       // the order of lock acquisition is whatever the plan happens to produce -- a bitmap
       // scan locks in physical order and sorts afterwards. Deadlock freedom here is meant
       // to hold by construction, not by whichever plan the planner picked today.
+      // The tenant is part of the predicate here and not only of the read below, so an
+      // account belonging to somebody else is never locked at all. Locking first and
+      // filtering afterwards would hold a stranger's row for the length of the
+      // transaction, which is a way to interfere with a tenant whose data you cannot see.
       const sorted = [...accountIds].sort();
       for (const id of sorted) {
-        await client.query("select 1 from accounts where id = $1 for update", [id]);
+        await client.query("select 1 from accounts where id = $1 and tenant_id = $2 for update", [
+          id,
+          tenantId,
+        ]);
       }
 
       const result = await client.query<AccountRow>(
@@ -176,8 +198,9 @@ function unitOfWork(client: PoolClient): UnitOfWork {
            from accounts a
            left join entries e on e.account_id = a.id
           where a.id = any($1::uuid[])
+            and a.tenant_id = $2
           group by a.id, a.type, a.currency, a.allows_negative`,
-        [sorted],
+        [sorted, tenantId],
       );
 
       return result.rows.map((row) => ({
@@ -189,19 +212,20 @@ function unitOfWork(client: PoolClient): UnitOfWork {
       }));
     },
 
-    findTransaction(id: string): Promise<StoredTransaction | null> {
-      return loadTransaction(client, "id", id);
+    findTransaction(id: string, tenantId: string): Promise<StoredTransaction | null> {
+      return loadTransaction(client, "id", id, tenantId);
     },
 
     async insertTransaction(transaction: TransactionToInsert): Promise<StoredTransaction> {
       const header = await client.query<{ seq: unknown; recorded_at: Date }>(
         `insert into transactions
-           (id, idempotency_key, request_hash, description, occurred_at,
+           (id, tenant_id, idempotency_key, request_hash, description, occurred_at,
             reverses_transaction_id)
-         values ($1, $2, $3, $4, $5, $6)
+         values ($1, $2, $3, $4, $5, $6, $7)
          returning seq, recorded_at`,
         [
           transaction.id,
+          transaction.tenantId,
           transaction.idempotencyKey,
           transaction.requestHash,
           transaction.description,
@@ -210,14 +234,20 @@ function unitOfWork(client: PoolClient): UnitOfWork {
         ],
       );
 
+      // The tenant is written onto every leg rather than joined for. It is what the two
+      // composite foreign keys check against, and the value used is the transaction's own,
+      // so an account belonging to anybody else fails the key instead of quietly recording
+      // a leg under the wrong owner.
       await client.query(
-        `insert into entries (id, transaction_id, account_id, currency, direction, amount)
+        `insert into entries
+           (id, transaction_id, tenant_id, account_id, currency, direction, amount)
          select *
-           from unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::bpchar[],
-                       $5::entry_direction[], $6::bigint[])`,
+           from unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::uuid[], $5::bpchar[],
+                       $6::entry_direction[], $7::bigint[])`,
         [
           transaction.entries.map((entry) => entry.id),
           transaction.entries.map(() => transaction.id),
+          transaction.entries.map(() => transaction.tenantId),
           transaction.entries.map((entry) => entry.accountId),
           transaction.entries.map((entry) => entry.currency),
           transaction.entries.map((entry) => entry.direction),
@@ -306,10 +336,15 @@ async function loadTransaction(
   queryable: Queryable,
   where: string,
   value: string,
+  tenantId: string,
 ): Promise<StoredTransaction | null> {
+  // The tenant is in the where clause and not in a check afterwards. A transaction that
+  // belongs to somebody else does not come back, so every caller already has the branch it
+  // needs -- the one it wrote for a transaction that does not exist -- and cannot answer
+  // the two differently.
   const header = await queryable.query<TransactionRow>(
-    `select ${TRANSACTION_COLUMNS} from transactions where ${where} = $1`,
-    [value],
+    `select ${TRANSACTION_COLUMNS} from transactions where ${where} = $1 and tenant_id = $2`,
+    [value, tenantId],
   );
 
   const row = header.rows[0];

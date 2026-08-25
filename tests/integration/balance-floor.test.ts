@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test";
 import pg from "pg";
 import { createLedgerStore } from "../../src/adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../../src/adapters/uuid-v7.ts";
+import { DEFAULT_TENANT_ID } from "../../src/domain/tenant.ts";
 import { postTransaction } from "../../src/application/post-transaction.ts";
 import type { PostOutcome } from "../../src/application/post-transaction.ts";
 import type { AccountType } from "../../src/domain/account.ts";
@@ -31,9 +32,9 @@ describe("the balance floor", { skip: skipWithoutDatabase }, () => {
   async function account(type: AccountType, allowsNegative = false): Promise<string> {
     const id = newId();
     await pool.query(
-      `insert into accounts (id, name, type, currency, allows_negative)
-       values ($1, $2, $3, 'USD', $4)`,
-      [id, `floor fixture ${id}`, type, allowsNegative],
+      `insert into accounts (id, name, type, currency, allows_negative, tenant_id)
+       values ($1, $2, $3, 'USD', $4, $5)`,
+      [id, `floor fixture ${id}`, type, allowsNegative, DEFAULT_TENANT_ID],
     );
     return id;
   }
@@ -48,7 +49,7 @@ describe("the balance floor", { skip: skipWithoutDatabase }, () => {
         { accountId: debit, direction: "debit", amount },
         { accountId: credit, direction: "credit", amount },
       ],
-    });
+    }, DEFAULT_TENANT_ID);
   }
 
   function assertRefused(outcome: PostOutcome): void {
@@ -80,7 +81,7 @@ describe("the balance floor", { skip: skipWithoutDatabase }, () => {
     const outcome = await move(cash, revenue, 50_000n);
 
     assert.equal(outcome.status, "posted", "earning revenue is not overdrawing it");
-    assert.equal((await store.findAccountBalance(revenue))?.balance, -50_000n);
+    assert.equal((await store.findAccountBalance(revenue, DEFAULT_TENANT_ID))?.balance, -50_000n);
   });
 
   it("refuses to take a credit-normal account below zero in its own direction", async () => {
@@ -106,7 +107,7 @@ describe("the balance floor", { skip: skipWithoutDatabase }, () => {
     const receiver = await account("asset", true);
 
     assert.equal((await move(receiver, spender, 25n)).status, "posted");
-    assert.equal((await store.findAccountBalance(spender))?.balance, -25n);
+    assert.equal((await store.findAccountBalance(spender, DEFAULT_TENANT_ID))?.balance, -25n);
   });
 
   it("judges the net effect, not the individual legs", async () => {
@@ -127,13 +128,13 @@ describe("the balance floor", { skip: skipWithoutDatabase }, () => {
         { accountId: other, direction: "debit", amount: 1_000n },
         { accountId: other, direction: "credit", amount: 1_000n },
       ],
-    });
+    }, DEFAULT_TENANT_ID);
 
     assert.equal(outcome.status, "posted");
-    assert.equal((await store.findAccountBalance(checking))?.balance, 5_000n);
+    assert.equal((await store.findAccountBalance(checking, DEFAULT_TENANT_ID))?.balance, 5_000n);
   });
 
   it("reports no balance for an account that does not exist", async () => {
-    assert.equal(await store.findAccountBalance(newId()), null);
+    assert.equal(await store.findAccountBalance(newId(), DEFAULT_TENANT_ID), null);
   });
 });

@@ -26,9 +26,15 @@ const DEFAULT_TENANT = "00000000-0000-0000-0000-000000000001";
 const WRITER_ID = newId();
 const READER_ID = newId();
 const REVOKED_ID = newId();
+const OUTSIDER_ID = newId();
 const writer = mintToken(WRITER_ID);
 const reader = mintToken(READER_ID);
 const revoked = mintToken(REVOKED_ID);
+
+// A second tenant with a perfectly valid write credential. Everything it is refused below
+// is refused because of whose data it reached for, not because of what it holds.
+const OTHER_TENANT = newId();
+const outsider = mintToken(OUTSIDER_ID);
 
 type Response = {
   readonly status: number;
@@ -72,6 +78,15 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
     );
     await admin.query("update api_keys set revoked_at = now() where id = $1", [REVOKED_ID]);
 
+    await admin.query("insert into tenants (id, name) values ($1, 'http suite outsider')", [
+      OTHER_TENANT,
+    ]);
+    await admin.query(
+      `insert into api_keys (id, tenant_id, name, secret_hash, scope)
+       values ($1, $2, 'http suite outsider', $3, 'write')`,
+      [OUTSIDER_ID, OTHER_TENANT, Buffer.from(outsider.secretHash)],
+    );
+
     // Port 0 lets the kernel pick a free one. A hardcoded port makes a test suite fail on
     // whichever machine already has something listening there.
     server = createLedgerServer({ store, credentials, newId, log: () => {} });
@@ -93,7 +108,7 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
       server.close(() => resolve());
     });
     await admin.query("delete from api_keys where id = any($1)", [
-      [WRITER_ID, READER_ID, REVOKED_ID],
+      [WRITER_ID, READER_ID, REVOKED_ID, OUTSIDER_ID],
     ]);
     await store.close();
     await credentials.close();
@@ -283,6 +298,130 @@ describe("the HTTP surface", { skip: skipWithoutDatabase }, () => {
       });
 
       assert.equal(response.status, 403);
+    });
+  });
+
+  describe("what one tenant sees of another", () => {
+    /**
+     * 404 and not 403, and the difference is the whole point. A 403 here would confirm that
+     * the id names something, which is an answer about somebody else's ledger. The refusal
+     * has to be indistinguishable from data that is not there -- and it is, because the
+     * query never returned a row and there was only ever one branch to write.
+     */
+    it("answers a foreign account's balance the way it answers an invented id", async () => {
+      const mine = await account("asset");
+
+      const foreign = await call("GET", `/v1/accounts/${mine}/balance`, {
+        token: outsider.token,
+      });
+      const invented = await call("GET", `/v1/accounts/${newId()}/balance`, {
+        token: outsider.token,
+      });
+
+      assert.equal(foreign.status, 404);
+      assert.equal(foreign.body["code"], invented.body["code"]);
+      assert.deepEqual(foreign.body["title"], invented.body["title"]);
+    });
+
+    it("does not show one tenant another's transaction", async () => {
+      const asset = await account("asset");
+      const revenue = await account("revenue");
+      const posted = await call("POST", "/v1/transactions", {
+        key: `tenancy-${newId()}`,
+        body: transfer(asset, revenue, "1000"),
+      });
+      assert.equal(posted.status, 201);
+
+      const seen = await call("GET", `/v1/transactions/${posted.body["id"] as string}`, {
+        token: outsider.token,
+      });
+      assert.equal(seen.status, 404);
+      assert.equal(seen.body["code"], "UNKNOWN_TRANSACTION");
+    });
+
+    it("does not let one tenant reverse another's transaction", async () => {
+      const asset = await account("asset");
+      const revenue = await account("revenue");
+      const posted = await call("POST", "/v1/transactions", {
+        key: `tenancy-rev-${newId()}`,
+        body: transfer(asset, revenue, "1000"),
+      });
+
+      const reversed = await call(
+        "POST",
+        `/v1/transactions/${posted.body["id"] as string}/reversal`,
+        { token: outsider.token, key: `steal-${newId()}`, body: { description: "not mine" } },
+      );
+
+      assert.equal(reversed.status, 404);
+      assert.equal(reversed.body["code"], "UNKNOWN_TRANSACTION");
+    });
+
+    it("refuses a posting that names an account belonging to another tenant", async () => {
+      const asset = await account("asset");
+      const revenue = await account("revenue");
+
+      const response = await call("POST", "/v1/transactions", {
+        token: outsider.token,
+        key: `cross-${newId()}`,
+        body: transfer(asset, revenue, "1000"),
+      });
+
+      assert.equal(response.status, 422);
+      assert.equal(response.body["code"], "UNKNOWN_ACCOUNT");
+    });
+
+    /**
+     * The owner of a new account comes from the credential and can come from nowhere else.
+     * The body parser refuses any field it was not told about, so a caller that tries to
+     * name an owner is told no rather than quietly ignored -- believing you chose an owner
+     * and not having done so is the worse of the two failures.
+     */
+    it("refuses a body that tries to choose an owner", async () => {
+      const response = await call("POST", "/v1/accounts", {
+        body: {
+          name: "Not yours to give",
+          type: "asset",
+          currency: "USD",
+          tenantId: OTHER_TENANT,
+        },
+      });
+
+      assert.equal(response.status, 400);
+      assert.equal(response.body["code"], "MALFORMED_REQUEST");
+      assert.match(String(response.body["detail"]), /tenantId/);
+    });
+
+    it("lets two tenants use the same idempotency key over HTTP", async () => {
+      const key = `shared-http-${newId()}`;
+      const asset = await account("asset");
+      const revenue = await account("revenue");
+
+      const mine = await call("POST", "/v1/transactions", {
+        key,
+        body: transfer(asset, revenue, "1000"),
+      });
+      assert.equal(mine.status, 201);
+
+      // The outsider reuses the key against its own accounts, and is neither given the
+      // other tenant's transaction nor told the key is taken.
+      const theirs = await call("POST", "/v1/accounts", {
+        token: outsider.token,
+        body: { name: "Outsider asset", type: "asset", currency: "USD", allowsNegative: true },
+      });
+      const theirRevenue = await call("POST", "/v1/accounts", {
+        token: outsider.token,
+        body: { name: "Outsider revenue", type: "revenue", currency: "USD", allowsNegative: true },
+      });
+
+      const posted = await call("POST", "/v1/transactions", {
+        token: outsider.token,
+        key,
+        body: transfer(theirs.body["id"] as string, theirRevenue.body["id"] as string, "1000"),
+      });
+
+      assert.equal(posted.status, 201);
+      assert.notEqual(posted.body["id"], mine.body["id"]);
     });
   });
 

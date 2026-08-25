@@ -4,8 +4,14 @@ import type { AccountType } from "../domain/account.ts";
 import type { Amount, Currency, Direction } from "../domain/money.ts";
 import type { CheckFindings, LedgerSize } from "../domain/reconciliation.ts";
 
+/**
+ * The tenant is not part of what a caller sends. It comes from the credential that made the
+ * request, because an account opened on behalf of somebody else is the first thing an
+ * ownership model has to make impossible.
+ */
 export type NewAccount = {
   readonly id: string;
+  readonly tenantId: string;
   readonly name: string;
   readonly type: AccountType;
   readonly currency: string;
@@ -60,6 +66,7 @@ export type StoredTransaction = {
 
 export type TransactionToInsert = {
   readonly id: string;
+  readonly tenantId: string;
   readonly idempotencyKey: string;
   readonly requestHash: string;
   readonly description: string;
@@ -77,8 +84,14 @@ export type UnitOfWork = {
    * Takes an exclusive lock on the given accounts and returns them with their current
    * balance. Implementations must lock in a deterministic order, otherwise two transfers
    * touching the same pair of accounts in opposite order deadlock.
+   *
+   * Accounts belonging to another tenant are not returned, and that is the authorization
+   * check rather than a filter applied before one. An account the caller does not own is
+   * absent for the same reason an account that was never created is absent, so the caller
+   * above cannot answer the two differently even by accident -- there is only one branch to
+   * write. Telling them apart would confirm to a stranger that an id exists.
    */
-  lockAccounts(accountIds: readonly string[]): Promise<readonly LockedAccount[]>;
+  lockAccounts(accountIds: readonly string[], tenantId: string): Promise<readonly LockedAccount[]>;
 
   /**
    * Writes the transaction and all of its entries, and returns it as stored, including
@@ -88,8 +101,11 @@ export type UnitOfWork = {
    */
   insertTransaction(transaction: TransactionToInsert): Promise<StoredTransaction>;
 
-  /** The transaction with this id and all of its entries, or null if there is none. */
-  findTransaction(id: string): Promise<StoredTransaction | null>;
+  /**
+   * The transaction with this id and all of its entries, or null if there is none, or if it
+   * belongs to another tenant. Scoped in the query for the reason lockAccounts is.
+   */
+  findTransaction(id: string, tenantId: string): Promise<StoredTransaction | null>;
 };
 
 export type LedgerStore = {
@@ -104,12 +120,18 @@ export type LedgerStore = {
    * exist both produce zero, and a caller that cannot tell those apart reports a balance
    * of zero for an id nobody ever created.
    */
-  findAccountBalance(accountId: string): Promise<AccountBalance | null>;
+  findAccountBalance(accountId: string, tenantId: string): Promise<AccountBalance | null>;
 
-  findByIdempotencyKey(key: string): Promise<StoredTransaction | null>;
+  /**
+   * Scoped to one tenant, and this is the scope the unique index now carries too. A key is
+   * a promise made to the caller that chose it: global uniqueness would let one tenant
+   * reach another's transaction by reusing a key it had already used, and reusing an
+   * obvious key is not a remote accident when callers name them after their own orders.
+   */
+  findByIdempotencyKey(tenantId: string, key: string): Promise<StoredTransaction | null>;
 
-  /** The transaction with this id and all of its entries, or null if there is none. */
-  findTransaction(id: string): Promise<StoredTransaction | null>;
+  /** The transaction with this id, or null if there is none or it belongs to someone else. */
+  findTransaction(id: string, tenantId: string): Promise<StoredTransaction | null>;
 
   /**
    * The currency, or null when the code is not one the ledger knows.

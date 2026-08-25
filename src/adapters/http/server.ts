@@ -2,10 +2,17 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import type { IdGenerator, LedgerStore, StoredTransaction } from "../../application/ports.ts";
+import type {
+  CredentialDirectory,
+  IdGenerator,
+  LedgerStore,
+  Scope,
+  StoredTransaction,
+} from "../../application/ports.ts";
 import { postTransaction } from "../../application/post-transaction.ts";
 import { reverseTransaction } from "../../application/reverse-transaction.ts";
-import { createAuthenticator } from "./auth.ts";
+import { createAuthenticator, scopeAllows } from "./auth.ts";
+import type { Principal } from "./auth.ts";
 import type { ParseResult } from "./parse.ts";
 import {
   parseIdempotencyKey,
@@ -37,8 +44,8 @@ export type LogLine = Readonly<Record<string, string | number>>;
 
 export type ServerDependencies = {
   readonly store: LedgerStore;
+  readonly credentials: CredentialDirectory;
   readonly newId: IdGenerator;
-  readonly token: string;
   readonly maxBodyBytes?: number;
   readonly log?: (line: LogLine) => void;
 };
@@ -50,6 +57,16 @@ type Reply = {
   readonly allow?: readonly string[];
 };
 
+/**
+ * A reply plus whoever earned it. The principal travels back out so the request log can
+ * name the caller, which is the only thing outside this function that needs it -- handlers
+ * are given what they need, not who asked.
+ */
+type Outcome = {
+  readonly reply: Reply;
+  readonly principal: Principal | null;
+};
+
 type RequestContext = {
   readonly params: RouteParams;
   readonly request: IncomingMessage;
@@ -58,15 +75,21 @@ type RequestContext = {
 };
 
 type Handler = {
-  /** False only for /health, which a load balancer has to reach without credentials. */
-  readonly authenticated: boolean;
+  /**
+   * The scope a credential must hold to reach this route. "none" belongs to /health alone,
+   * which a load balancer has to reach without credentials.
+   *
+   * Declared per route rather than derived from the method, so that adding a route forces
+   * the question to be answered instead of inherited.
+   */
+  readonly requires: Scope | "none";
   /** True for the routes that read a JSON body, which are exactly the writes. */
   readonly reads: boolean;
   handle(context: RequestContext): Promise<Reply>;
 };
 
 export function createLedgerServer(deps: ServerDependencies): Server {
-  const authenticate = createAuthenticator(deps.token);
+  const authenticate = createAuthenticator(deps.credentials);
   const maxBodyBytes = deps.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const log = deps.log ?? ((line: LogLine) => console.log(JSON.stringify(line)));
   const router = createRouter<Handler>(routes(deps));
@@ -75,9 +98,15 @@ export function createLedgerServer(deps: ServerDependencies): Server {
     const requestId = deps.newId();
     const startedAt = process.hrtime.bigint();
 
+    // Written from inside the chain and read in the finally, so that one log line covers
+    // both the answered and the failed path. It stays null when the request never got as
+    // far as presenting a usable credential.
+    let caller: Principal | null = null;
+
     void dispatch(request, requestId)
-      .then((reply) => {
-        send(response, reply, requestId);
+      .then((outcome) => {
+        caller = outcome.principal;
+        send(response, outcome.reply, requestId);
       })
       .catch((error: unknown) => {
         // Anything reaching here is a bug rather than a refusal: every expected failure is
@@ -102,6 +131,13 @@ export function createLedgerServer(deps: ServerDependencies): Server {
         );
       })
       .finally(() => {
+        // Who made the request, on every line. With one shared token there was nothing to
+        // say; with a credential per caller, a log that cannot attribute a request is a log
+        // that cannot answer the first question anyone asks of it. The key id is also what
+        // `revoke-key` takes, so a line here is enough to act on.
+        const attribution: LogLine =
+          caller === null ? {} : { tenantId: caller.tenantId, keyId: caller.keyId };
+
         log({
           event: "request",
           requestId,
@@ -109,6 +145,7 @@ export function createLedgerServer(deps: ServerDependencies): Server {
           path: (request.url ?? "").split("?")[0] ?? "",
           status: response.statusCode,
           durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
+          ...attribution,
         });
       });
   });
@@ -117,55 +154,80 @@ export function createLedgerServer(deps: ServerDependencies): Server {
   server.headersTimeout = HEADERS_TIMEOUT_MS;
   return server;
 
-  async function dispatch(request: IncomingMessage, requestId: string): Promise<Reply> {
+  async function dispatch(request: IncomingMessage, requestId: string): Promise<Outcome> {
     const match = router.match(request.method, request.url);
 
     if (match.kind === "bad-target") {
-      return problemReply("MALFORMED_REQUEST", match.detail);
+      return anonymous(problemReply("MALFORMED_REQUEST", match.detail));
     }
     if (match.kind === "not-found") {
-      return problemReply("NOT_FOUND", `no route for ${request.method} ${request.url}`);
+      return anonymous(problemReply("NOT_FOUND", `no route for ${request.method} ${request.url}`));
     }
     if (match.kind === "method-not-allowed") {
-      return {
+      return anonymous({
         ...problemReply("METHOD_NOT_ALLOWED", `${request.method} is not allowed on this path`),
         allow: match.allowed,
-      };
+      });
     }
 
     const handler = match.handler;
 
-    if (handler.authenticated && !authenticate(request.headers.authorization)) {
-      return problemReply("UNAUTHORIZED", "a valid bearer token is required");
+    // Identity first, then scope, then the body. Refusing before reading means a caller
+    // that may not use this route cannot make the server hold its payload in memory.
+    let principal: Principal | null = null;
+    if (handler.requires !== "none") {
+      principal = await authenticate(request.headers.authorization);
+      if (principal === null) {
+        return anonymous(problemReply("UNAUTHORIZED", "a valid bearer token is required"));
+      }
+
+      if (!scopeAllows(principal.scope, handler.requires)) {
+        return {
+          principal,
+          reply: problemReply(
+            "FORBIDDEN",
+            `this credential holds the ${principal.scope} scope; ` +
+              `${request.method} on this path requires ${handler.requires}`,
+          ),
+        };
+      }
     }
 
+    const context = { params: match.params, request, requestId };
+
     if (!handler.reads) {
-      return handler.handle({ params: match.params, request, body: undefined, requestId });
+      return { principal, reply: await handler.handle({ ...context, body: undefined }) };
     }
 
     if (!isJson(request.headers["content-type"])) {
-      return problemReply(
-        "UNSUPPORTED_MEDIA_TYPE",
-        `this endpoint accepts ${JSON_CONTENT_TYPE} only`,
-      );
+      return {
+        principal,
+        reply: problemReply(
+          "UNSUPPORTED_MEDIA_TYPE",
+          `this endpoint accepts ${JSON_CONTENT_TYPE} only`,
+        ),
+      };
     }
 
     const raw = await readBody(request, maxBodyBytes);
     if (!raw.ok) {
-      return problemReply(raw.code, raw.message);
+      return { principal, reply: problemReply(raw.code, raw.message) };
     }
 
     let body: unknown;
     try {
       body = JSON.parse(raw.value);
     } catch (error) {
-      return problemReply(
-        "MALFORMED_REQUEST",
-        `body is not valid JSON: ${error instanceof Error ? error.message : "unreadable"}`,
-      );
+      return {
+        principal,
+        reply: problemReply(
+          "MALFORMED_REQUEST",
+          `body is not valid JSON: ${error instanceof Error ? error.message : "unreadable"}`,
+        ),
+      };
     }
 
-    return handler.handle({ params: match.params, request, body, requestId });
+    return { principal, reply: await handler.handle({ ...context, body }) };
   }
 }
 
@@ -174,7 +236,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
 
   return {
     "GET /health": {
-      authenticated: false,
+      requires: "none",
       reads: false,
       async handle(): Promise<Reply> {
         try {
@@ -192,7 +254,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
     },
 
     "POST /v1/accounts": {
-      authenticated: true,
+      requires: "write",
       reads: true,
       async handle(context): Promise<Reply> {
         const parsed = parseNewAccount(context.body);
@@ -222,7 +284,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
     },
 
     "POST /v1/transactions": {
-      authenticated: true,
+      requires: "write",
       reads: true,
       async handle(context): Promise<Reply> {
         const key = parseIdempotencyKey(context.request.headers["idempotency-key"]);
@@ -250,7 +312,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
     },
 
     "POST /v1/transactions/:id/reversal": {
-      authenticated: true,
+      requires: "write",
       reads: true,
       async handle(context): Promise<Reply> {
         const id = pathUuid(context.params, "id");
@@ -286,7 +348,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
     },
 
     "GET /v1/transactions/:id": {
-      authenticated: true,
+      requires: "read",
       reads: false,
       async handle(context): Promise<Reply> {
         const id = pathUuid(context.params, "id");
@@ -304,7 +366,7 @@ function routes(deps: ServerDependencies): Record<string, Handler> {
     },
 
     "GET /v1/accounts/:id/balance": {
-      authenticated: true,
+      requires: "read",
       reads: false,
       async handle(context): Promise<Reply> {
         const id = pathUuid(context.params, "id");
@@ -355,6 +417,11 @@ async function requireCurrency(
     throw new Error(`currency ${code} is referenced by stored rows but is not in currencies`);
   }
   return currency;
+}
+
+/** A reply from before anyone was identified, or from a route that identifies nobody. */
+function anonymous(reply: Reply): Outcome {
+  return { reply, principal: null };
 }
 
 function problemReply(code: ProblemCode, detail: string): Reply {

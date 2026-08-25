@@ -3,6 +3,7 @@
 
 import { loadServerConfig } from "../config.ts";
 import { createLedgerServer } from "../adapters/http/server.ts";
+import { createCredentialDirectory } from "../adapters/postgres/credential-directory.ts";
 import { createLedgerStore } from "../adapters/postgres/ledger-store.ts";
 import { createUuidV7 } from "../adapters/uuid-v7.ts";
 
@@ -18,10 +19,11 @@ async function main(): Promise<void> {
   // passed down, and nothing below this line reads the environment.
   const config = loadServerConfig();
   const store = createLedgerStore(config.databaseUrl);
+  const credentials = createCredentialDirectory(config.databaseUrl);
   const server = createLedgerServer({
     store,
+    credentials,
     newId: createUuidV7(),
-    token: config.apiToken,
   });
 
   // Fail at startup, not at the first request. A server that accepts connections it cannot
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
     await closed;
     clearTimeout(forced);
     await store.close();
+    await credentials.close();
     console.log(JSON.stringify({ event: "shutdown.complete" }));
   }
 }

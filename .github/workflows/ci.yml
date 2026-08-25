@@ -69,6 +69,16 @@ jobs:
       - name: Provisioning is idempotent
         run: npm run provision
 
+      # The documented start-up now includes issuing a credential, so the arbiter walks
+      # that too rather than taking the entry point on trust. It also establishes that a
+      # freshly migrated database already has the tenant to issue against.
+      #
+      # The token it prints is dropped. The database it belongs to is destroyed with the
+      # job, so nothing is at risk either way -- but a repository that prints secrets into
+      # a build log teaches that habit to whoever copies it.
+      - name: Issue an API credential
+        run: npm run issue-key -- ci-smoke > /dev/null
+
       - name: Test
         run: npm test
 

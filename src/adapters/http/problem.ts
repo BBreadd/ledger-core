@@ -23,6 +23,7 @@ export type SurfaceCode =
   | "MISSING_IDEMPOTENCY_KEY"
   | "UNKNOWN_CURRENCY"
   | "UNAUTHORIZED"
+  | "FORBIDDEN"
   | "NOT_FOUND"
   | "METHOD_NOT_ALLOWED"
   | "UNSUPPORTED_MEDIA_TYPE"
@@ -84,6 +85,14 @@ const PROBLEMS: Readonly<Record<ProblemCode, { readonly status: number; readonly
     MISSING_IDEMPOTENCY_KEY: { status: 400, title: "Idempotency-Key header is required" },
     UNKNOWN_CURRENCY: { status: UNPROCESSABLE, title: "Unknown currency" },
     UNAUTHORIZED: { status: 401, title: "Unauthorized" },
+
+    // 403 and not 404, and the distinction is the one place this surface is allowed to be
+    // candid about an authorization failure. A caller told its scope is too narrow learns
+    // only what its own credential is, which it already knew. Refusing to reach somebody
+    // else's data is a different answer entirely, and it is not this one -- that has to be
+    // indistinguishable from data that is not there.
+    FORBIDDEN: { status: 403, title: "Forbidden" },
+
     NOT_FOUND: { status: 404, title: "Not found" },
     METHOD_NOT_ALLOWED: { status: 405, title: "Method not allowed" },
     UNSUPPORTED_MEDIA_TYPE: { status: 415, title: "Unsupported media type" },

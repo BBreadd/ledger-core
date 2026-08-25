@@ -182,6 +182,58 @@ export type ReconciliationReader = {
   close(): Promise<void>;
 };
 
+/**
+ * What a credential is allowed to do, as opposed to what it is allowed to touch. The two
+ * are different questions and this answers only the first: `read` may call the endpoints
+ * that read, `write` may call all of them. Which accounts a caller may reach is a property
+ * of the data, not of the endpoint, and is not decided here.
+ *
+ * `write` includes `read` rather than being disjoint from it. A credential that could post
+ * a transaction but not read one back would be refused the GET that the Location header of
+ * its own 201 points at.
+ */
+export type Scope = "read" | "write";
+
+/**
+ * A credential as stored, minus anything that would let it be reconstructed. The digest is
+ * here because comparing it is the caller's job -- putting the comparison behind the port
+ * would move cryptography into the database adapter, where it has no business being.
+ *
+ * Uint8Array rather than Buffer so the port stays free of Node-specific types. Buffer is
+ * one, which is why the adapter can satisfy this without converting anything.
+ */
+export type ApiKeyRecord = {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly scope: Scope;
+  readonly secretHash: Uint8Array;
+};
+
+/**
+ * Turns a key id into the credential it names, for whoever has to decide whether a request
+ * is allowed to proceed.
+ *
+ * Kept out of LedgerStore on the same grounds that kept ReconciliationSource out of it: an
+ * API key is not the ledger. Nothing about a credential is a posting, a balance or an
+ * account, and a store that answered questions about both would make it impossible to say
+ * later that these are read under different circumstances.
+ *
+ * Revoked keys are absent rather than returned with a flag. A single branch cannot leak the
+ * difference between "no such key" and "that key is finished", and both have to produce the
+ * same answer anyway.
+ *
+ * Discarded -- returning revoked_at and letting the caller decide: it would let a log line
+ * say "a key you revoked is still being used", which is worth knowing. It also puts a
+ * second branch on the authentication path, where the cost of getting a branch wrong is an
+ * accepted request. The log line is not worth that.
+ */
+export type CredentialDirectory = {
+  /** The live key with this id, or null when there is none or it has been revoked. */
+  findKey(id: string): Promise<ApiKeyRecord | null>;
+
+  close(): Promise<void>;
+};
+
 /** Raised by the adapter when the unique index on idempotency_key rejects an insert. */
 export class DuplicateIdempotencyKeyError extends Error {
   readonly detail: string;
